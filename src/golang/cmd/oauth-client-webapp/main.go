@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bluesky-social/indigo/atproto/auth/oauth"
+	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/pkg/errors"
 )
 
@@ -36,7 +37,7 @@ func GlobalStateFromContext(ctx context.Context) *GlobalState {
 	return nil
 }
 
-func OAuthSessionFromContext(ctx context.Context) *GlobalState {
+func OAuthSessionFromContext(ctx context.Context) *oauth.ClientSessionData {
 	if v := ctx.Value(oauthSessionKey); v != nil {
 		if s, ok := v.(*oauth.ClientSessionData); ok {
 			return s
@@ -99,21 +100,46 @@ func NewOAuthApp(ctx context.Context, state *GlobalState) error {
 func WithOAuthSession(state *GlobalState) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			var ctx *context.Context
-			did, err := r.Cookie("session_id")
+			ctx := r.Context()
+
+			runNext := func(s *oauth.ClientSessionData) {
+				newCtx := context.WithValue(ctx, oauthSessionKey, s)
+				next.ServeHTTP(w, r.WithContext(newCtx))
+			}
+
+			accountDIDCookie, err := r.Cookie("account_did")
 			if err != nil {
 				log.Printf("error getting cookie=account_did method=%s path=%s", r.Method, r.URL.Path)
-				ctx = context.WithValue(r.Context(), oauthSessionKey, nil)
-			} else {
-				session, err := state.OAuthApp.GetSession(ctx, sessionId)
-				log.Printf("error getting session method=%s path=%s session_id=%s", r.Method, r.URL.Path, sessionId)
-				if err != nil {
-					ctx = context.WithValue(r.Context(), oauthSessionKey, nil)
-				} else {
-					ctx = context.WithValue(r.Context(), oauthSessionKey, session)
-				}
+				runNext(nil)
+				return
 			}
-			next.ServeHTTP(w, r.WithContext(ctx))
+
+			did, err := syntax.ParseDID(accountDIDCookie.Value)
+			if err != nil {
+				log.Printf("error parsing cookie=account_did method=%s path=%s did=%s", r.Method, r.URL.Path, accountDIDCookie.Value)
+				runNext(nil)
+				return
+			}
+
+			sessionIdCookie, err := r.Cookie("session_id")
+			if err != nil {
+				log.Printf("error getting cookie=session_id method=%s path=%s", r.Method, r.URL.Path)
+				runNext(nil)
+				return
+			}
+
+			session, err := state.OAuthApp.Store.GetSession(
+				ctx,
+				did,
+				sessionIdCookie.Value,
+			)
+			if err != nil {
+				log.Printf("error getting session method=%s path=%s did=%s sessionIdCookie=%+v: %+v", r.Method, r.URL.Path, did, sessionIdCookie, err)
+				runNext(nil)
+				return
+			}
+
+			runNext(session)
 		})
 	}
 }
@@ -135,7 +161,7 @@ func realMain(ctx context.Context) error {
 	mux.HandleFunc("GET /oauth/login", HandleLogin)
 	mux.HandleFunc("GET /oauth/callback", HandleOAuthCallback)
 
-	handler := WithOAuthSession()(mux)
+	handler := WithOAuthSession(state)(mux)
 
 	return listenAndServe(ctx, state, handler)
 }
@@ -167,8 +193,7 @@ func listenAndServe(ctx context.Context, state *GlobalState, handler http.Handle
 	server := &http.Server{
 		Handler: handler,
 		BaseContext: func(l net.Listener) context.Context {
-			ctx := context.WithValue(r.Context(), globalStateKey, state)
-			return ctx
+			return context.WithValue(ctx, globalStateKey, state)
 		},
 	}
 
@@ -233,6 +258,7 @@ func HandleLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("error starting oauth flow method=%s path=%s: %+v", r.Method, r.URL.Path, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	log.Printf("redirecting for oauth flow method=%s path=%s redirectURL=%s", r.Method, r.URL.Path, redirectURL)
@@ -255,9 +281,20 @@ func HandleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("error processing oauth callback method=%s path=%s: %+v", r.Method, r.URL.Path, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	log.Printf("oauth callback success method=%s path=%s did=%s scopes=%+v", r.Method, r.URL.Path, sessData.AccountDID, sessData.Scopes)
+
+	err = state.OAuthApp.Store.SaveSession(
+		ctx,
+		*sessData,
+	)
+	if err != nil {
+		log.Printf("error saving session method=%s path=%s sessData=%+v", r.Method, r.URL.Path, sessData)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// TODO HSTS, CSP, etc.
 	http.SetCookie(w, &http.Cookie{
@@ -312,31 +349,21 @@ func HandleServeRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oauthApp := state.OAuthApp
-
-	doc := oauthApp.Config.ClientMetadata()
+	// oauthApp := state.OAuthApp
 
 	session := OAuthSessionFromContext(ctx)
 	if session == nil {
 		log.Printf("oauth session not found method=%s path=%s", r.Method, r.URL.Path)
-		//
-		http.Error(w, fmt.Sprintf("%s/oauth/login?identifier=${handle}.bsky.social", state.ThisEndpoint), http.OK)
+		http.Error(w, fmt.Sprintf("%s/oauth/login?identifier=${handle}.bsky.social", state.ThisEndpoint), http.StatusOK)
 		return
 	}
-
-	did, err := r.Cookie("account_did")
-	if err != nil {
-		// User not logged in
-		// TODO Serve form for redirect to login page and example ssh from client
-
-		log.Printf("error getting cookie=account_did method=%s path=%s", r.Method, r.URL.Path)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	log.Printf("got did method=%s path=%s did=%s", r.Method, r.URL.Path, did)
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(doc); err != nil {
+	if err := json.NewEncoder(w).Encode(struct {
+		Feed string
+	}{
+		Feed: "face",
+	}); err != nil {
 		log.Printf("error encoding client metadata method=%s path=%s: %+v", r.Method, r.URL.Path, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
