@@ -1,8 +1,6 @@
-// AGI_SOCK=/tmp/agi.sock go run agi_sshd.go
+// go run agi_sshd.go
 //
-//	ssh -NnT -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o PasswordAuthentication=no \
-//	  -R /tmux.sock:$(echo $TMUX | sed -e 's/,.*//g') \
-//	  -R /input.sock:$(mktemp -d)/input.sock user@localhost
+// ssh -NnT -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o PasswordAuthentication=no -R 80:127.0.0.1:8080 user@localhost
 package main
 
 import (
@@ -13,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -76,6 +75,13 @@ func loadOrGenerateHostKey(path string) (ssh.Signer, error) {
 	privDER := x509.MarshalPKCS1PrivateKey(priv)
 	privPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER})
 	return ssh.ParsePrivateKey(privPEM)
+}
+
+type TCPIPForward struct {
+	BindAddr   string
+	BindPort   uint32
+	OriginAddr string
+	OriginPort uint32
 }
 
 func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
@@ -152,6 +158,50 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 			_ = ssh.Unmarshal(req.Payload, &p)
 			base := filepath.Base(p.SocketPath)
 			log.Printf("📨 cancel-forward request: %s", p.SocketPath)
+
+			mu.Lock()
+			if f, ok := forwards[base]; ok {
+				f.listener.Close()
+				delete(forwards, base)
+				log.Printf("🗑 removed forward %s", base)
+			}
+			mu.Unlock()
+			req.Reply(true, nil)
+
+		case "tcpip-forward":
+			var p TCPIPForward
+			_ = ssh.Unmarshal(req.Payload, &p)
+
+			base := "tcp.sock"
+			localPath := filepath.Join(tmpDir, base)
+			log.Printf("📨 tcpip-forward request: %s:%d → local=%s", p.BindAddr, p.BindPort, localPath)
+
+			listener, err := net.Listen("unix", localPath)
+			if err != nil {
+				log.Printf("❌ failed to listen on %s: %v", localPath, err)
+				req.Reply(false, nil)
+				continue
+			}
+
+			mu.Lock()
+			forwards[base] = &forward{listener, localPath, fmt.Sprintf("%s:%d", p.BindAddr, p.BindPort)}
+			count = len(forwards)
+			mu.Unlock()
+
+			req.Reply(true, nil)
+
+			go acceptTCPLoop(ctx, listener, serverConn, &p)
+
+			if !notified && count >= 5 {
+				notified = true
+				go notifyAGI(ctx, &mu, forwards)
+			}
+
+		case "cancel-tcpip-forward":
+			var p TCPIPForward
+			_ = ssh.Unmarshal(req.Payload, &p)
+			base := "tcp.sock"
+			log.Printf("📨 cancel-tcpip-forward request: %s:%d", p.BindAddr, p.BindPort)
 
 			mu.Lock()
 			if f, ok := forwards[base]; ok {
@@ -269,6 +319,45 @@ func handleConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, remotePa
 	io.Copy(conn, channel)
 	channel.Close()
 	log.Printf("✅ closed proxy for %s", remotePath)
+}
+
+func acceptTCPLoop(ctx context.Context, listener net.Listener, sc *ssh.ServerConn, f *TCPIPForward) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("ℹ️ TCP proxy listener closed for %s:%d", f.BindAddr, f.BindPort)
+			return
+		}
+		log.Printf("🔗 incoming connection on %s (TCP forward to %s:%d)", listener.Addr(), f.BindAddr, f.BindPort)
+		go handleTCPConn(ctx, conn, sc, f)
+	}
+}
+
+func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TCPIPForward) {
+	defer conn.Close()
+	log.Printf("↔ proxying TCP data for %s:%d", f.BindAddr, f.BindPort)
+
+	payload := ssh.Marshal(TCPIPForward{
+		BindAddr:   f.BindAddr,
+		BindPort:   f.BindPort,
+		OriginAddr: f.BindAddr,
+		OriginPort: f.BindPort,
+	})
+
+	channel, reqs, err := sc.OpenChannel("forwarded-tcpip", payload)
+	if err != nil {
+		log.Printf("❌ OpenChannel forwarded-tcpip failed for %s:%d: %v", f.BindAddr, f.BindPort, err)
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+
+	go func() {
+		io.Copy(channel, conn)
+		channel.CloseWrite()
+	}()
+	io.Copy(conn, channel)
+	channel.Close()
+	log.Printf("✅ closed TCP proxy for %s:%d", f.BindAddr, f.BindPort)
 }
 
 func notifyAGI(ctx context.Context, mu *sync.Mutex, forwards map[string]*forward) {
