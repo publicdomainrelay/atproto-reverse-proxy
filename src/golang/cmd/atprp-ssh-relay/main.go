@@ -207,15 +207,14 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 				userHandle:  serverConn.User(),
 			}
 			mu.Lock()
-			forwards[p.BindAddr] = f
+			err = configureNewForward(ctx, f)
 			mu.Unlock()
-
-			err = configureNewForward(ctx, &mu, f)
 			if err != nil {
 				log.Printf("❌ failed to setup caddy forward for %s: %v", p.BindAddr, err)
 				req.Reply(false, nil)
 				continue
 			}
+			forwards[p.BindAddr] = f
 
 			req.Reply(true, nil)
 
@@ -229,6 +228,7 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 			mu.Lock()
 			if f, ok := forwards[p.BindAddr]; ok {
 				f.listener.Close()
+				unconfigureForward(ctx, f)
 				delete(forwards, p.BindAddr)
 				log.Printf("🗑 removed forward %s", p.BindAddr)
 			}
@@ -247,6 +247,13 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	log.Println("🔒 SSH session closed, cleaning up")
 
 	// TODO Remove from Caddy
+	// TODO Range over forwards
+	//			if f, ok := forwards[p.BindAddr]; ok {
+	//				f.listener.Close()
+	//				unconfigureForward(ctx, f)
+	//				delete(forwards, p.BindAddr)
+	//				log.Printf("🗑 removed forward %s", p.BindAddr)
+	//			}
 }
 
 func acceptTCPLoop(ctx context.Context, listener net.Listener, sc *ssh.ServerConn, f *TCPIPForward) {
@@ -288,54 +295,174 @@ func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TC
 	log.Printf("✅ closed TCP proxy for %s:%d", f.BindAddr, f.BindPort)
 }
 
-func configureNewForward(ctx context.Context, mu *sync.Mutex, f *forward) error {
-	thisEndpoint := os.Getenv("THIS_ENDPOINT")
-	if thisEndpoint == "" {
-		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
-	}
-
-	fqdn := fmt.Sprinf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint)
-
-	// The unix socket we want caddy to reverse proxy the FQDN to
-	forwardTo := f.localPath
-
-	log.Printf("fqdn: %s", data)
-
-	// TODO Add to Caddy
-	caddySockPath := os.Getenv("CADDY_SOCK")
-	if caddySockPath == "" {
-		return
-	}
-
-	body, _ := json.Marshal(data)
-	client := &http.Client{
+// getCaddyClient is a helper to build an HTTP client that communicates over a Unix socket
+func getCaddyClient(caddySockPath string) *http.Client {
+	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 				return net.Dial("unix", caddySockPath)
 			},
 		},
 	}
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://admin", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	defer resp.Body.Close()
-	if err != nil {
-		return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
-	}
 }
 
-func unconfigureForward(ctx context.Context, mu *sync.Mutex, f *forward) error {
+// ensureSrv0Exists checks if srv0 is initialized and creates it if not.
+func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
+	checkReq, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1/config/apps/http/servers/srv0", nil)
+	resp, err := client.Do(checkReq)
+	if err == nil {
+		defer resp.Body.Close()
+		log.Printf("caddy check srv0 resp.StatusCode=%s", resp.StatusCode)
+		if resp.StatusCode == http.StatusOK {
+			return nil
+		}
+	}
+	log.Println("caddy creating srv0...")
+
+	// Initialize the standard server structure if srv0 is missing
+	srvPayload := map[string]any{
+		"listen": []string{":443"}, // e.g. ":443" or a unix socket
+		"routes": []any{},
+	}
+
+	body, _ := json.Marshal(srvPayload)
+	// Create srv0. The "..." in the path ensures intermediate keys like 'apps' and 'http' are created if missing.
+	setupReq, err := http.NewRequestWithContext(ctx, "POST", "http://127.0.0.1/config/apps/http/servers/srv0", bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrap(err, "error building request to create srv0")
+	}
+	setupReq.Header.Set("Content-Type", "application/json")
+
+	setupResp, err := client.Do(setupReq)
+	if err != nil {
+		return errors.Wrap(err, "error creating srv0")
+	}
+	defer setupResp.Body.Close()
+	log.Println("created srv0")
+	return nil
+}
+
+func configureNewForward(ctx context.Context, f *forward) error {
 	thisEndpoint := os.Getenv("THIS_ENDPOINT")
 	if thisEndpoint == "" {
 		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
 	}
 
-	fqdn := fmt.Sprinf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint)
+	fqdn := fmt.Sprintf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint)
+	routeID := "route-" + fqdn
+	forwardTo := f.localPath
 
-	log.Printf("fqdn=%s", fqdn)
+	// Build the Caddy route JSON.
+	routePayload := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{
+			{"host": []string{fqdn}},
+		},
+		"handle": []map[string]any{
+			{
+				"handler": "subroute",
+				"routes": []map[string]any{
+					{
+						"handle": []map[string]any{
+							{
+								"handler": "reverse_proxy",
+								"upstreams": []map[string]any{
+									{"dial": "unix/" + forwardTo},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		"terminal": true,
+	}
 
-	// TODO Remove from Caddy
+	caddySockPath := os.Getenv("CADDY_SOCK")
+	if caddySockPath == "" {
+		return fmt.Errorf("CADDY_SOCK must be set")
+	}
+
+	client := getCaddyClient(caddySockPath)
+
+	// Ensure the server exists to avoid 404 when posting to the routes array
+	if err := ensureSrv0Exists(ctx, client); err != nil {
+		return errors.Wrap(err, "failed to ensure srv0 existence")
+	}
+
+	// 1. Remove the existing route first (if replacing/updating)
+	deleteReq, err := http.NewRequestWithContext(ctx, "DELETE", fmt.Sprintf("http://127.0.0.1/id/%s", routeID), nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to create delete request")
+	}
+	deleteResp, err := client.Do(deleteReq)
+	if err == nil {
+		io.Copy(io.Discard, deleteResp.Body)
+		deleteResp.Body.Close()
+	}
+
+	// 2. Append the new route
+	body, err := json.Marshal(routePayload)
+	if err != nil {
+		return errors.Wrap(err, "failed to marshal route payload")
+	}
+
+	reqPath := "http://127.0.0.1/config/apps/http/servers/srv0/routes"
+	req, err := http.NewRequestWithContext(ctx, "POST", reqPath, bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrap(err, "failed to create post request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned non-success status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
+func unconfigureForward(ctx context.Context, f *forward) error {
+	thisEndpoint := os.Getenv("THIS_ENDPOINT")
+	if thisEndpoint == "" {
+		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
+	}
+
+	fqdn := fmt.Sprintf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint)
+	routeID := "route-" + fqdn
+
+	caddySockPath := os.Getenv("CADDY_SOCK")
+	if caddySockPath == "" {
+		return fmt.Errorf("CADDY_SOCK must be set")
+	}
+
+	client := getCaddyClient(caddySockPath)
+
+	// Direct DELETE using the Caddy ID shortcut removes it instantly
+	req, err := http.NewRequestWithContext(ctx, "DELETE", fmt.Sprintf("http://127.0.0.1/id/%s", routeID), nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to create delete request")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.Wrap(err, fmt.Sprintf("error removing caddy config for fqdn=%s", fqdn))
+	}
+	defer resp.Body.Close()
+
+	// A 404 indicates it was already successfully removed (or never existed).
+	if resp.StatusCode >= 300 && resp.StatusCode != http.StatusNotFound {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned non-success status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
 }
 
 // ATProto
