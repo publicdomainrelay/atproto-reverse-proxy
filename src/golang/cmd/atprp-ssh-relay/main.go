@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -25,6 +26,12 @@ import (
 	"sync"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/bluesky-social/indigo/api/agnostic"
+	"github.com/bluesky-social/indigo/atproto/identity"
+	"github.com/bluesky-social/indigo/atproto/syntax"
+	"github.com/bluesky-social/indigo/xrpc"
+	"github.com/pkg/errors"
 )
 
 // forward represents a single remote->local UNIX socket forward
@@ -44,7 +51,49 @@ func main() {
 		log.Fatalf("❌ host key load/generate failed: %v", err)
 	}
 
-	cfg := &ssh.ServerConfig{NoClientAuth: true}
+	cfg := &ssh.ServerConfig{
+		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+			ctx := context.Background()
+
+			// Check if we have a valid ATProto handle as SSH username
+			log.Printf("Resolving DID PLC and PDS for user=%s", c.User())
+			ident, err := resolveATProtoIdentifier(ctx, c.User())
+			if err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("Failed to resolve DID PLC and PDS for user=%s: %v", c.User()))
+			}
+			pds := ident.PDSEndpoint()
+			if pds == "" {
+				return nil, errors.Wrap(err, fmt.Sprintf("Could not find PDS for user=%s", c.User()))
+			}
+			log.Printf("Got DID PLC and PDS for user=%s did=%s pds=%s", c.User(), ident.DID, pds)
+
+			log.Printf("Resolving public keys for user=%s", c.User())
+			sshPublicKeys, err := getSSHPublicKeys(ctx, pds, ident.DID.String())
+			if err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("Failed get ssh public keys for user=%s: %v", c.User(), err))
+			}
+			log.Printf("Got ssh public keys for user=%s sshPublicKeys=%+v", c.User(), sshPublicKeys)
+
+			for _, sshPublicKey := range sshPublicKeys {
+				authorizedKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(sshPublicKey.Key))
+				if err != nil {
+					log.Printf("error parsing ssh public key for user=%s key=%s: %v", c.User(), sshPublicKey.Key, err)
+					continue
+				}
+
+				if string(authorizedKey.Marshal()) == string(pubKey.Marshal()) {
+					return &ssh.Permissions{
+						// Record the public key used for authentication.
+						Extensions: map[string]string{
+							"pubkey-fp":                ssh.FingerprintSHA256(pubKey),
+							"pubkey-valid-for-service": sshPublicKey.Service,
+						},
+					}, nil
+				}
+			}
+			return nil, fmt.Errorf("unknown public key for %q", c.User())
+		},
+	}
 	cfg.AddHostKey(signer)
 
 	ln, err := net.Listen("tcp", ":2222")
@@ -124,6 +173,8 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	forwards := make(map[string]*forward)
 	var mu sync.Mutex
 
+	// TODO If we do not get a request for forwarding to serviceName in X seconds,
+	// cancel the connection/context and return.
 	for req := range reqs {
 		switch req.Type {
 		case "tcpip-forward":
@@ -253,4 +304,90 @@ func notifyNewForward(ctx context.Context, mu *sync.Mutex, forwards map[string]*
 	}
 	resp.Body.Close()
 	log.Printf("✅ AGI POST success: %d forwards sent: %v", len(data), data)
+}
+
+// ATProto
+
+// Data holds fedproxy specific data
+type Data struct {
+	SSHPublicKeys []*SSHPublicKey `json:"sshPublicKeys"`
+}
+
+type SSHPublicKey struct {
+	Type      string `json:"$type"`
+	Key       string `json:"key"`
+	Name      string `json:"name"`
+	Service   string `json:"service"`
+	CreatedAt string `json:"createdAt"`
+}
+
+func (k *SSHPublicKey) ATProtoDecode(rec *agnostic.RepoListRecords_Record) error {
+	if rec == nil || rec.Value == nil {
+		return fmt.Errorf("error decoding ATProto SSHPublicKey record has no value")
+	}
+
+	if err := json.Unmarshal(*rec.Value, k); err != nil {
+		return errors.Wrap(err, fmt.Sprintf("error decoding ATProto SSHPublicKey json.Unmarshal"))
+	}
+
+	return nil
+}
+
+func resolveATProtoIdentifier(ctx context.Context, inputId string) (*identity.Identity, error) {
+	id, err := syntax.ParseAtIdentifier(inputId)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("valid syntax", "at-identifier", id)
+
+	// https://github.com/bluesky-social/indigo/blob/ce62b8fce9e01434213a69cb251852b2c9436cb9/atproto/identity/directory.go#L65
+	// DefaultDirectory is https://plc.directory
+	dir := identity.DefaultDirectory()
+	ident, err := dir.Lookup(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	return ident, nil
+}
+
+func getSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
+	pds := &xrpc.Client{Host: pdsUrl} // or the user's PDS endpoint
+	collection := "com.fedproxy.sshPublicKey"
+
+	sshPublicKeys := make([]*SSHPublicKey, 0)
+
+	const limit int64 = 100
+	cursor := ""
+
+	for {
+		// last arg is reverse (oldest first)
+		out, err := agnostic.RepoListRecords(ctx, pds, collection, cursor, limit, did, false)
+		if err != nil {
+			return nil, errors.Wrap(err, fmt.Sprintf("error calling RepoListRecords(pds=%s, did=%s)", pds, did))
+		}
+
+		for _, rec := range out.Records {
+			if rec == nil {
+				continue
+			}
+			fmt.Printf("uri=%s cid=%s value=%s\n", rec.Uri, rec.Cid, rec.Value)
+
+			var sshPublicKey SSHPublicKey
+
+			err := sshPublicKey.ATProtoDecode(rec)
+			if err != nil {
+				return nil, errors.Wrap(err, fmt.Sprintf("error unmarshaling json value of type sshPublicKey(pds=%s, did=%s, uri=%s)", pds, did, rec.Uri))
+			}
+
+			sshPublicKeys = append(sshPublicKeys, &sshPublicKey)
+		}
+
+		if out.Cursor == nil || *out.Cursor == "" {
+			break
+		}
+		cursor = *out.Cursor
+	}
+
+	return sshPublicKeys, nil
 }
