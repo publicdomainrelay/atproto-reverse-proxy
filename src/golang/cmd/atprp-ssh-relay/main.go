@@ -82,6 +82,7 @@ func main() {
 				}
 
 				if string(authorizedKey.Marshal()) == string(pubKey.Marshal()) {
+					log.Printf("key is valid for service=%s", sshPublicKey.Service)
 					return &ssh.Permissions{
 						// Record the public key used for authentication.
 						Extensions: map[string]string{
@@ -184,6 +185,13 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 			base := "tcp.sock"
 			localPath := filepath.Join(tmpDir, base)
 			log.Printf("📨 tcpip-forward request: %s:%d → local=%s", p.BindAddr, p.BindPort, localPath)
+
+			pubkeyValidForService := serverConn.Permissions.Extensions["pubkey-valid-for-service"]
+			if pubkeyValidForService != "*" && pubkeyValidForService != p.BindAddr {
+				log.Printf("public key not valid for service=%s is valid_for=%s", p.BindAddr, pubkeyValidForService)
+				req.Reply(false, nil)
+				continue
+			}
 
 			listener, err := net.Listen("unix", localPath)
 			if err != nil {
