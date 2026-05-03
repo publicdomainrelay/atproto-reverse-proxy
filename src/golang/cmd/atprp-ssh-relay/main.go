@@ -200,27 +200,37 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 				continue
 			}
 
+			f := &forward{
+				listener:    listener,
+				localPath:   localPath,
+				serviceName: p.BindAddr,
+				userHandle:  serverConn.User(),
+			}
 			mu.Lock()
-			forwards[base] = &forward{listener, localPath, fmt.Sprintf("%s:%d", p.BindAddr, p.BindPort), serverConn.User()}
+			forwards[p.BindAddr] = f
 			mu.Unlock()
+
+			err = configureNewForward(ctx, &mu, f)
+			if err != nil {
+				log.Printf("❌ failed to setup caddy forward for %s: %v", p.BindAddr, err)
+				req.Reply(false, nil)
+				continue
+			}
 
 			req.Reply(true, nil)
 
 			go acceptTCPLoop(ctx, listener, serverConn, &p)
 
-			go notifyNewForward(ctx, &mu, forwards)
-
 		case "cancel-tcpip-forward":
 			var p TCPIPForward
 			_ = ssh.Unmarshal(req.Payload, &p)
-			base := "tcp.sock"
 			log.Printf("📨 cancel-tcpip-forward request: %s:%d", p.BindAddr, p.BindPort)
 
 			mu.Lock()
-			if f, ok := forwards[base]; ok {
+			if f, ok := forwards[p.BindAddr]; ok {
 				f.listener.Close()
-				delete(forwards, base)
-				log.Printf("🗑 removed forward %s", base)
+				delete(forwards, p.BindAddr)
+				log.Printf("🗑 removed forward %s", p.BindAddr)
 			}
 			mu.Unlock()
 			req.Reply(true, nil)
@@ -235,6 +245,8 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 
 	<-ctx.Done()
 	log.Println("🔒 SSH session closed, cleaning up")
+
+	// TODO Remove from Caddy
 }
 
 func acceptTCPLoop(ctx context.Context, listener net.Listener, sc *ssh.ServerConn, f *TCPIPForward) {
@@ -276,21 +288,22 @@ func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TC
 	log.Printf("✅ closed TCP proxy for %s:%d", f.BindAddr, f.BindPort)
 }
 
-func notifyNewForward(ctx context.Context, mu *sync.Mutex, forwards map[string]*forward) {
-
-	mu.Lock()
-	data := make(map[string]string, len(forwards))
-	for base, f := range forwards {
-		data[base] = f.localPath
-		data["service-name"] = f.serviceName
-		data["handle"] = f.userHandle
+func configureNewForward(ctx context.Context, mu *sync.Mutex, f *forward) error {
+	thisEndpoint := os.Getenv("THIS_ENDPOINT")
+	if thisEndpoint == "" {
+		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
 	}
-	mu.Unlock()
 
-	log.Printf("data: %+v", data)
+	fqdn := fmt.Sprinf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint)
 
-	control := os.Getenv("CONTROL_SOCK")
-	if control == "" {
+	// The unix socket we want caddy to reverse proxy the FQDN to
+	forwardTo := f.localPath
+
+	log.Printf("fqdn: %s", data)
+
+	// TODO Add to Caddy
+	caddySockPath := os.Getenv("CADDY_SOCK")
+	if caddySockPath == "" {
 		return
 	}
 
@@ -298,20 +311,31 @@ func notifyNewForward(ctx context.Context, mu *sync.Mutex, forwards map[string]*
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", control)
+				return net.Dial("unix", caddySockPath)
 			},
 		},
 	}
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://unix/connect/tmux", bytes.NewReader(body))
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://admin", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
+	defer resp.Body.Close()
 	if err != nil {
-		log.Printf("❌ AGI POST error: %v", err)
-		return
+		return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
 	}
-	resp.Body.Close()
-	log.Printf("✅ AGI POST success: %d forwards sent: %v", len(data), data)
+}
+
+func unconfigureForward(ctx context.Context, mu *sync.Mutex, f *forward) error {
+	thisEndpoint := os.Getenv("THIS_ENDPOINT")
+	if thisEndpoint == "" {
+		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
+	}
+
+	fqdn := fmt.Sprinf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint)
+
+	log.Printf("fqdn=%s", fqdn)
+
+	// TODO Remove from Caddy
 }
 
 // ATProto
