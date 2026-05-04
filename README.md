@@ -2,6 +2,20 @@
 
 https://fedproxy.com
 
+## Auto Domain on Boot
+
+Could be combined with https://github.com/digitalocean-labs/droplet-oidc-poc/tree/main#atproto-login-and-rbac-configuration to automate getting a Droplet a resolvable domain after boot and doing service discovery via ATProto, or etc by:
+
+- Configure RBAC policies for Droplet workload identity reverse proxy to allow [Droplet to allow calling `com.atproto.repo.createRecord` with `service: my-cool-service`](https://github.com/digitalocean-labs/droplet-oidc-poc/blob/ea8be96b16f309ad240cdbfe59a0c91d0807f426/scripts/setup.sh#L34-L41)
+
+- Spin Droplet using workload identity reverse proxy
+
+- Via Droplet `user_data` create ssh key pair and run example for `/xrpc/com.atproto.repo.createRecord` using [`com.fedproxy.sshPublicKey`](https://github.com/publicdomainrelay/atproto-reverse-proxy/blob/c9f49516611879aaf62ce1806f8e6cdf721b2c12/src/javascript/fedproxy-ssh-public-keys/main.js#L237-L247)
+
+- `curl` down the systemd service file (**TODO**)
+
+- Have the Droplet `systemctl enable --now my-cool-sevice.handle.example.com@fedproxy.service`
+
 <img width="1490" height="2284" alt="Screenshot From 2026-05-03 18-39-52" src="https://github.com/user-attachments/assets/a9883a6f-eb0a-494f-8560-e05d1851f941" />
 
 ## Deployment
@@ -20,6 +34,8 @@ usermod -G sudo deploy
 echo "deploy   ALL=(ALL:ALL) NOPASSWD:ALL" | tee -a /etc/sudoers
 EOF
 ```
+
+## 
 
 ## Notes
 
