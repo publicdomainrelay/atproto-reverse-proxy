@@ -67,5 +67,28 @@ jobs:
         sudo mv /tmp/fedproxy-ssh-public-keys /var/www/html
         sudo mv /tmp/stage/Caddyfile /etc/caddy/Caddyfile
         sudo mv /tmp/stage/atprp-ssh-relay /usr/bin/atprp-ssh-relay
+        sudo systemctl daemon-reload
         sudo systemctl enable --now caddy
-        sudo systemctl kill --signal=SIGUSR1 caddy
+        sudo systemctl reload caddy
+
+        sudo tee /etc/systemd/system/atprp-ssh-relay.service > /dev/null <<'EOF'
+        [Unit]
+        Description=atprp-ssh-relay
+        After=network.target caddy.service
+        Wants=caddy.service
+        [Service]
+        Type=simple
+        ExecStart=/usr/bin/atprp-ssh-relay
+        Restart=on-failure
+        Environment=THIS_ENDPOINT=fedproxy.com
+        Environment=CADDY_SOCK=/tmp/caddy-admin.sock
+        WorkingDirectory=/var/run
+        RestartSec=5
+
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now atprp-ssh-relay.service
+        sudo systemctl status --no-pager atprp-ssh-relay.service
