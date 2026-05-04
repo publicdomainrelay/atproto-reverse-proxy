@@ -9,9 +9,20 @@
 		code {
 			/* fsr pico sets this to inline-block? */
 			display: inline;
+			word-break: break-all;
 		}
 		article {
 			max-width: 100%;
+		}
+		.key-list-item {
+			margin-bottom: 1rem;
+			padding-bottom: 1rem;
+			border-bottom: 1px solid var(--pico-muted-border-color);
+		}
+		.key-list-item:last-child {
+			border-bottom: none;
+			margin-bottom: 0;
+			padding-bottom: 0;
 		}
 	</style>
 	<title>FedProxy</title>
@@ -77,15 +88,14 @@
 			</article>
 
 			<!-- hidden by default, will be shown if a ssh-public-key has been created -->
-			<article id="success-container" style="display: none;">
+			<article id="success-container" style="display: none; border-color: #4CAF50;">
 				<h2>Success!</h2>
 				<p>The ssh-public-key record has been created on your PDS. It should be visible at: </p><a id="success-pdsls" target="_blank" href="#">PDSls link</a>
 			</article>
 
+			<!-- hidden by default, will be shown if a login session has been established -->
 			<article id="ssh-public-keys-list-container" style="display: none;">
-				<p>Here are your active keys and services</p>
-				<h3>Add SSH Public Key</h3>
-				<p id="ssh-public-key-form-error" style="color: #E37474;"></p>
+				<div id="ssh-public-keys-list" aria-busy="true">Loading keys...</div>
 			</article>
 
 		</section>

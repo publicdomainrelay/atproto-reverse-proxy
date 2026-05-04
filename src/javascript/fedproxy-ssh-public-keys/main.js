@@ -17,6 +17,108 @@ const clientId = buildClientID();
 let oac; // undefined | BrowserOAuthClient
 let agent; // undefined | Agent   (gets assigned after successful auth)
 
+// Helper function to fetch and render SSH Keys securely
+async function fetchAndRenderKeys() {
+	const listContainer = document.getElementById("ssh-public-keys-list");
+	listContainer.setAttribute("aria-busy", "true");
+	listContainer.innerHTML = ""; // Clear existing
+
+	let sshPublicKeysByService = {};
+	let cursor = undefined;
+
+	try {
+		while (cursor === undefined || cursor != null) {
+			const res = await agent.com.atproto.repo.listRecords({
+				repo: agent.did,
+				collection: 'com.fedproxy.sshPublicKey',
+				cursor: cursor,
+			});
+
+			if (!res.success) {
+				throw new Error(JSON.stringify(res));
+			}
+
+			for (let i = 0; i < res.data.records.length; i++) {
+				const sshPublicKey = res.data.records[i].value;
+				if (!(sshPublicKey.service in sshPublicKeysByService)) {
+					sshPublicKeysByService[sshPublicKey.service] = [];
+				}
+				sshPublicKeysByService[sshPublicKey.service].push(sshPublicKey);
+			}
+
+			if (typeof res.data.cursor === "string") {
+				cursor = res.data.cursor;
+			} else {
+				cursor = null;
+			}
+		}
+
+		listContainer.removeAttribute("aria-busy");
+
+		const services = Object.keys(sshPublicKeysByService);
+		if (services.length === 0) {
+			listContainer.innerHTML = "<p><em>No SSH keys found. Create one above!</em></p>";
+			return;
+		}
+
+		// Render lists securely to prevent XSS
+		for (const [service, keys] of Object.entries(sshPublicKeysByService)) {
+			const article = document.createElement('article');
+
+			const details = document.createElement('details');
+			details.open = true; // Keep open by default for visibility
+
+			const summary = document.createElement('summary');
+			const serviceStrong = document.createElement('h3');
+			serviceStrong.textContent = `Service: ${service}`
+			summary.appendChild(serviceStrong);
+			details.appendChild(summary);
+
+			const ul = document.createElement('ul');
+			ul.style.listStyleType = 'none';
+			ul.style.paddingLeft = '0';
+
+			keys.forEach(k => {
+				const li = document.createElement('li');
+				li.className = 'key-list-item';
+
+				const nameStrong = document.createElement('strong');
+				nameStrong.textContent = k.name;
+
+				const dateSmall = document.createElement('small');
+				if (k.createdAt) {
+					dateSmall.textContent = ` (Created: ${new Date(k.createdAt).toLocaleDateString()})`;
+					dateSmall.style.color = "var(--pico-muted-color)";
+				}
+
+				const br = document.createElement('br');
+
+				const keyCode = document.createElement('code');
+				keyCode.textContent = k.key;
+				keyCode.style.fontSize = "0.85em";
+				keyCode.style.display = "block";
+				keyCode.style.marginTop = "0.5rem";
+				keyCode.style.padding = "0.5rem";
+				keyCode.style.backgroundColor = "var(--pico-code-background-color)";
+
+				li.appendChild(nameStrong);
+				li.appendChild(dateSmall);
+				li.appendChild(br);
+				li.appendChild(keyCode);
+				ul.appendChild(li);
+			});
+
+			details.appendChild(ul);
+			article.appendChild(details);
+			listContainer.appendChild(article);
+		}
+
+	} catch (err) {
+		listContainer.removeAttribute("aria-busy");
+		listContainer.innerHTML = `<p style="color: #E37474;">Error loading keys: ${err.message}</p>`;
+	}
+}
+
 // If there was an existing OAuth session, we restore it.
 // Otherwise, we present the login UI to the user.
 async function init() {
@@ -66,39 +168,11 @@ async function init() {
 
 			document.getElementById("welcome-message").innerText = `@${res.data.handle}`;
 			document.getElementById("ssh-public-key-container").style.display = "inherit"; // unhide
+			document.getElementById("ssh-public-keys-list-container").style.display = "inherit"; // unhide list section
 			document.getElementById("logout-nav").style.display = "inherit"; // unhide
 
-			let sshPublicKeysByService = {};
-			let cursor = undefined;
-
-			while (cursor === undefined || cursor != null) {
-				const res = await agent.com.atproto.repo.listRecords({
-					repo: agent.did,
-					collection: 'com.fedproxy.sshPublicKey',
-					cursor: cursor,
-				});
-
-				if (!res.success) {
-					throw new Error(JSON.stringify(res));
-				}
-
-				for (let i = 0; i < res.data.records.length; i++) {
-					const sshPublicKey = res.data.records[i].value;
-					if (!(sshPublicKey.service in sshPublicKeysByService)) {
-						sshPublicKeysByService[sshPublicKey.service] = [];
-					}
-					sshPublicKeysByService[sshPublicKey.service].push(sshPublicKey);
-				}
-
-
-				if (typeof res.data.cursor === "string") {
-					cursor = res.data.cursor;
-				} else {
-					cursor = null;
-				}
-			}
-
-			console.log(sshPublicKeysByService)
+			// Fetch and render keys
+			await fetchAndRenderKeys();
 
 		} else { // there is no existing session
 			document.getElementById("login-container").style.display = "inherit"; // unhide
@@ -157,16 +231,18 @@ async function doPost(name, service, key) {
 	}
 
 	const atUri = res.data.uri;
-	const [uriRepo, uriCollection, uriRkey] = atUri.split('/').slice(2);
-	const pdsHost = (await agent.sessionManager.getTokenInfo()).aud;
-
-	// hide the "ssh-public-key" screen
-	createSSHPublicKeyButton.removeAttribute("aria-busy");
-	document.getElementById("ssh-public-key-container").style.display = "none";
 
 	// show the "success" screen
+	createSSHPublicKeyButton.removeAttribute("aria-busy");
 	document.getElementById("success-pdsls").href = `https://pdsls.dev/${atUri}`;
 	document.getElementById("success-container").style.display = "inherit"; // unhide
+
+	// Refetch the keys so the new one appears in the list directly below
+	await fetchAndRenderKeys();
+
+	// Reset the form so they can easily create another one
+	document.getElementById("ssh-public-key-form").reset();
+	document.getElementById("ssh-public-key-form-error").innerText = "";
 }
 
 document.addEventListener('DOMContentLoaded', init);
