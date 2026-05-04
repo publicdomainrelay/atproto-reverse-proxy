@@ -67,6 +67,39 @@ async function init() {
 			document.getElementById("welcome-message").innerText = `@${res.data.handle}`;
 			document.getElementById("ssh-public-key-container").style.display = "inherit"; // unhide
 			document.getElementById("logout-nav").style.display = "inherit"; // unhide
+
+			let sshPublicKeysByService = {};
+			let cursor = undefined;
+
+			while (cursor === undefined || cursor != null) {
+				const res = await agent.com.atproto.repo.listRecords({
+					repo: agent.did,
+					collection: 'com.fedproxy.sshPublicKey',
+					cursor: cursor,
+				});
+
+				if (!res.success) {
+					throw new Error(JSON.stringify(res));
+				}
+
+				for (let i = 0; i < res.data.records.length; i++) {
+					const sshPublicKey = res.data.records[i].value;
+					if (!(sshPublicKey.service in sshPublicKeysByService)) {
+						sshPublicKeysByService[sshPublicKey.service] = [];
+					}
+					sshPublicKeysByService[sshPublicKey.service].push(sshPublicKey);
+				}
+
+
+				if (typeof res.data.cursor === "string") {
+					cursor = res.data.cursor;
+				} else {
+					cursor = null;
+				}
+			}
+
+			console.log(sshPublicKeysByService)
+
 		} else { // there is no existing session
 			document.getElementById("login-container").style.display = "inherit"; // unhide
 		}
