@@ -23,7 +23,7 @@ jobs:
         persist-credentials: false
 
     - name: Install opkssh
-      run: curl -sSLf https://raw.githubusercontent.com/openpubkey/opkssh/main/scripts/install-linux.sh | bash
+      run: curl -sSLf https://raw.githubusercontent.com/openpubkey/opkssh/main/scripts/install-linux.sh | sudo bash
 
     - name: Login
       run: opkssh login github
