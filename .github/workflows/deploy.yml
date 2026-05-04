@@ -30,7 +30,7 @@ jobs:
       run: |
         cd src/golang/
         mkdir -p target
-        go build -o target/atprp-ssh-relay ./src/golang/cmd/atprp-ssh-relay/main.go
+        go build -o target/atprp-ssh-relay ./cmd/atprp-ssh-relay/main.go
 
     - name: Install opkssh
       run: curl -sSLf https://raw.githubusercontent.com/openpubkey/opkssh/main/scripts/install-linux.sh | sudo bash
