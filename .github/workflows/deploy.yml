@@ -95,3 +95,10 @@ jobs:
         sudo systemctl daemon-reload
         sudo systemctl enable --now atprp-ssh-relay.service
         sudo systemctl status --no-pager atprp-ssh-relay.service
+
+        sudo sed -n '1,200p' /usr/lib/systemd/system/caddy.service >/tmp/caddy.service.tmp
+        sudo sed -i '/^User=/d; /^Group=/d; /^PrivateTmp=/d; /^ProtectSystem=/d' /tmp/caddy.service.tmp
+        sudo sed -i '1iUser=root\nGroup=root\nPrivateTmp=no\nProtectSystem=off' /tmp/caddy.service.tmp
+        sudo install -m644 /tmp/caddy.service.tmp /usr/lib/systemd/system/caddy.service
+        sudo systemctl daemon-reload
+        sudo systemctl restart caddy.service
