@@ -6,13 +6,17 @@
 # curl -v --unix-socket caddy-admin.sock http://127.0.0.1/config/ | jq
 {
 	# Expose Caddy’s admin API on a Unix socket
-	admin unix/{env.PWD}/caddy-admin.sock
+  # admin unix/{env.PWD}/caddy-admin.sock
+	admin unix//tmp/caddy-admin.sock
 	log default {
 		level debug
 	}
 }
 
-# Listen on a Unix socket
+# Web UI
 https://fedproxy.com {
-	reverse_proxy http://127.0.0.1:8080 # unix/{env.PWD}/web-ui.sock
+	file_server {
+		root /var/www/html
+		index index.html
+	}
 }
