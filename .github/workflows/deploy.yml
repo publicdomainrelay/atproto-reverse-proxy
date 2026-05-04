@@ -26,7 +26,11 @@ jobs:
       with:
         go-version: '1.26'
 
-    - run: go build -o atprp-ssh-relay ./src/golang/cmd/atprp-ssh-relay/main.go
+    - name: Build golang
+      run: |
+        cd src/golang/
+        mkdir -p target
+        go build -o target/atprp-ssh-relay ./src/golang/cmd/atprp-ssh-relay/main.go
 
     - name: Install opkssh
       run: curl -sSLf https://raw.githubusercontent.com/openpubkey/opkssh/main/scripts/install-linux.sh | sudo bash
@@ -52,7 +56,7 @@ jobs:
       run: |
         scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/Caddyfile /etc/caddy/Caddyfile
         scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/javascript/fedproxy-ssh-public-keys /tmp/new-www
-        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" atprp-ssh-relay /usr/bin/atprp-ssh-relay
+        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/target/atprp-ssh-relay /usr/bin/atprp-ssh-relay
 
     - name: Run commands on server
       shell: bash -e run-via-ssh.sh {0}
