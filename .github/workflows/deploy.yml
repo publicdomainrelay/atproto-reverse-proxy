@@ -63,6 +63,7 @@ jobs:
       shell: bash -e run-via-ssh.sh {0}
       run: |
         sudo rm -rf /var/www/html
+        sudo mkdir -pv /var/www/
         sudo mv /tmp/fedproxy-ssh-public-keys /var/www/html
         sudo mv /tmp/stage/Caddyfile /etc/caddy/Caddyfile
         sudo mv /tmp/stage/atprp-ssh-relay /usr/bin/atprp-ssh-relay
