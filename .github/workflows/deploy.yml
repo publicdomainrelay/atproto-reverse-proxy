@@ -28,6 +28,10 @@ jobs:
     - name: Login
       run: opkssh login github
 
+    - name: Check connection
+      run: |
+        ssh -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" "echo 'Hello from GitHub Actions'"
+
     - name: SSH runner helper
       shell: cp {0} run-via-ssh.sh
       run: |
