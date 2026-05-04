@@ -40,7 +40,7 @@ jobs:
         ip a
 
     - name: Run commands on server
-      shell: bash -e ${{ github.workspace }}/run-via-ssh.sh {0}
+      shell: bash -e run-via-ssh.sh {0}
       run: |
         hostname
         ip a
