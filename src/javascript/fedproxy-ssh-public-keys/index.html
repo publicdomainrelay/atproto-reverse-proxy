@@ -50,6 +50,21 @@
 				</nav>
 			</header>
 
+			<article id="ssh-public-key-instructions">
+				<h3>Instructions</h3>
+				<p>Add ssh keys for the services you want to proxy to.</p>
+				<p>Then start ssh client (for example to forward spindle-0001 to port 8080 on the machine you run ssh on and added the key for):</p>
+        <pre id="example-ssh-command">
+
+ssh -NnT -p 2222 \
+  -o UserKnownHostsFile=/dev/null \
+  -o StrictHostKeyChecking=no \
+  -o PasswordAuthentication=no \
+  -R my-cool-service:80:127.0.0.1:8080 \
+  handle.example.com@fedproxy.com
+        </pre>
+			</article>
+
 			<article id="loading-spinner">
 				<h3 aria-busy="true">Loading session...</h3>
 				<article id="loading-error" style="display: none; background-color: #861D13;">

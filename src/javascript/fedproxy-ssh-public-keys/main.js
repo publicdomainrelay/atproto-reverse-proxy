@@ -18,7 +18,7 @@ let oac; // undefined | BrowserOAuthClient
 let agent; // undefined | Agent   (gets assigned after successful auth)
 
 // Helper function to fetch and render SSH Keys securely
-async function fetchAndRenderKeys() {
+async function fetchAndRenderKeys(handle) {
 	const listContainer = document.getElementById("ssh-public-keys-list");
 	listContainer.setAttribute("aria-busy", "true");
 	listContainer.innerHTML = ""; // Clear existing
@@ -65,13 +65,36 @@ async function fetchAndRenderKeys() {
 		for (const [service, keys] of Object.entries(sshPublicKeysByService)) {
 			const article = document.createElement('article');
 
+			const serviceHeader = document.createElement('h3');
+			if (service !== "*") {
+				const serviceLink = document.createElement('a');
+				serviceLink.setAttribute("target", "_blank");
+				serviceLink.href = `https://${service}.${handle}.fedproxy.com`;
+				serviceLink.textContent  = service;
+				serviceHeader.appendChild(serviceLink)
+			} else {
+				serviceHeader.textContent = "*";
+			}
+
+			const exampleSSHCommandTemplate = document.getElementById("example-ssh-command").textContent;
+			const exampleSSHCommand = document.createElement('pre');
+			exampleSSHCommand.textContent = exampleSSHCommandTemplate ;
+			exampleSSHCommand.textContent = exampleSSHCommand.textContent.replace(
+				/handle.example.com/g,
+				handle,
+			);
+			if (service !== "*") {
+				exampleSSHCommand.textContent = exampleSSHCommand.textContent.replace(
+					/my-cool-service/g,
+					service,
+				);
+			}
+
 			const details = document.createElement('details');
-			details.open = true; // Keep open by default for visibility
+			details.open = true;
 
 			const summary = document.createElement('summary');
-			const serviceStrong = document.createElement('h3');
-			serviceStrong.textContent = `Service: ${service}`
-			summary.appendChild(serviceStrong);
+			summary.textContent = `Toggle show/hide`
 			details.appendChild(summary);
 
 			const ul = document.createElement('ul');
@@ -109,6 +132,8 @@ async function fetchAndRenderKeys() {
 			});
 
 			details.appendChild(ul);
+			article.appendChild(serviceHeader);
+			article.appendChild(exampleSSHCommand);
 			article.appendChild(details);
 			listContainer.appendChild(article);
 		}
@@ -172,7 +197,7 @@ async function init() {
 			document.getElementById("logout-nav").style.display = "inherit"; // unhide
 
 			// Fetch and render keys
-			await fetchAndRenderKeys();
+			await fetchAndRenderKeys(res.data.handle);
 
 		} else { // there is no existing session
 			document.getElementById("login-container").style.display = "inherit"; // unhide
