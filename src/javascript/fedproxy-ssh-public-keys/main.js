@@ -1,5 +1,5 @@
 import { BrowserOAuthClient } from '@atproto/oauth-client-browser'
-import { Agent, RichText } from '@atproto/api'
+import { Agent } from '@atproto/api'
 
 function buildClientID() {
 	const isLocal = ["localhost", "127.0.0.1"].includes(window.location.hostname);
@@ -30,9 +30,9 @@ async function init() {
 		doLogin("https://bsky.social");
 	}
 
-	document.getElementById("post-form").onsubmit = function(e) {
+	document.getElementById("ssh-public-key-form").onsubmit = function(e) {
 		e.preventDefault();
-		doPost(document.getElementById("post-text").value);
+		doPost(document.getElementById("ssh-public-key-name").value, document.getElementById("ssh-public-key-service").value, document.getElementById("ssh-public-key-key").value);
 	}
 
 	document.getElementById("logout-nav").onclick = function() {
@@ -65,7 +65,7 @@ async function init() {
 			}
 
 			document.getElementById("welcome-message").innerText = `@${res.data.handle}`;
-			document.getElementById("post-container").style.display = "inherit"; // unhide
+			document.getElementById("ssh-public-key-container").style.display = "inherit"; // unhide
 			document.getElementById("logout-nav").style.display = "inherit"; // unhide
 		} else { // there is no existing session
 			document.getElementById("login-container").style.display = "inherit"; // unhide
@@ -96,12 +96,9 @@ async function doLogin(identifier) {
 	loginButton.removeAttribute("aria-busy");
 }
 
-async function doPost(message) {
-	const postButton = document.getElementById("post-button");
-	postButton.setAttribute("aria-busy", "true");
-
-	const rt = new RichText({text: message});
-	await rt.detectFacets(agent);
+async function doPost(name, service, key) {
+	const createSSHPublicKeyButton = document.getElementById("ssh-public-key-button");
+	createSSHPublicKeyButton.setAttribute("aria-busy", "true");
 
 	let res;
 	try {
@@ -110,8 +107,9 @@ async function doPost(message) {
 			collection: 'com.fedproxy.sshPublicKey',
 			record: {
 				$type: 'com.fedproxy.sshPublicKey',
-				key: message,
-				facets: rt.facets,
+				key: key.replace(/(\r\n|\n|\r)/g, ''),
+				name: name.replace(/(\r\n|\n|\r)/g, ''),
+				service: service.replace(/(\r\n|\n|\r)/g, ''),
 				createdAt: new Date().toISOString(),
 			},
 		});
@@ -120,8 +118,8 @@ async function doPost(message) {
 			throw new Error(JSON.stringify(res));
 		}
 	} catch (err) {
-		document.getElementById("post-form-error").innerText = `${err}`;
-		postButton.removeAttribute("aria-busy");
+		document.getElementById("ssh-public-key-form-error").innerText = `${err}`;
+		createSSHPublicKeyButton.removeAttribute("aria-busy");
 		return;
 	}
 
@@ -129,14 +127,11 @@ async function doPost(message) {
 	const [uriRepo, uriCollection, uriRkey] = atUri.split('/').slice(2);
 	const pdsHost = (await agent.sessionManager.getTokenInfo()).aud;
 
-	// hide the "post" screen
-	postButton.removeAttribute("aria-busy");
-	document.getElementById("post-container").style.display = "none";
+	// hide the "ssh-public-key" screen
+	createSSHPublicKeyButton.removeAttribute("aria-busy");
+	document.getElementById("ssh-public-key-container").style.display = "none";
 
 	// show the "success" screen
-	document.getElementById("success-pds").href = `${pdsHost}xrpc/com.atproto.repo.getRecord?repo=${uriRepo}&collection=com.fedproxy.sshPublicKey&rkey=${uriRkey}`;
-	document.getElementById("success-bsky").href = `https://bsky.app/profile/${uriRepo}/post/${uriRkey}`;
-	document.getElementById("success-blacksky").href = `https://blacksky.community/profile/${uriRepo}/post/${uriRkey}`;
 	document.getElementById("success-pdsls").href = `https://pdsls.dev/${atUri}`;
 	document.getElementById("success-container").style.display = "inherit"; // unhide
 }

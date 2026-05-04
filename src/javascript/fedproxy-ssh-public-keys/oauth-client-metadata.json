@@ -12,9 +12,8 @@
   "response_types": [
     "code"
   ],
-  "scope": "atproto repo:app.bsky.feed.post?action=create",
-  "token_endpoint_auth_method": "private_key_jwt",
-  "token_endpoint_auth_signing_alg": "ES256",
-  "client_name": "atproto OAuth VanillaJS SPA Demo",
+  "scope": "atproto repo:com.fedproxy.sshPublicKey?action=create",
+  "token_endpoint_auth_method": "none",
+  "client_name": "FedProxy",
   "client_uri": "https://fedproxy.com"
 }

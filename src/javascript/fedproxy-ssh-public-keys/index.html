@@ -11,10 +11,10 @@
 			display: inline;
 		}
 		article {
-			max-width: 32em;
+			max-width: 100%;
 		}
 	</style>
-	<title>atproto OAuth Browser Client Example</title>
+	<title>FedProxy</title>
 	<script type="importmap">
 	{
 		"imports": {
@@ -29,12 +29,12 @@
 		<section class="content">
 			<header>
 				<hgroup>
-					<h1>atproto OAuth Browser Client Example</h1>
+					<h1>FedProxy</h1>
 				</hgroup>
 				<nav>
 					<ul>
 						<li id="logout-nav" style="display: none;"><a href="#">Logout</a></li>
-						<li><a href="https://github.com/bluesky-social/cookbook">Code</a></li>
+						<li><a href="https://github.com/publicdomainrelay/atproto-reverse-proxy">Source Code</a></li>
 					</ul>
 				</nav>
 			</header>
@@ -51,7 +51,7 @@
 				<form id="login-form">
 					<p>Enter your handle to continue</p>
 					<fieldset role="group">
-						<input name="username" id="username" placeholder="@alice.example.com" style="font-family: monospace;" required>
+						<input name="username" id="username" placeholder="alice.example.com" style="font-family: monospace;" required>
 						<button id="login-button">Login</button>
 					</fieldset>
 				</form>
@@ -63,28 +63,29 @@
 			</article>
 
 			<!-- hidden by default, will be shown if a login session has been established -->
-			<article id="post-container" style="display: none;">
+			<article id="ssh-public-key-container" style="display: none;">
 				<p>Welcome, <code id="welcome-message"></code></p>
-				<h3>Compose Post</h3>
-				<form id="post-form">
-					<textarea name="post_text" placeholder="What's up?" id="post-text" required autofocus>I'm testing the Vanilla JS #ExampleOAuthClient</textarea>
-					<button id="post-button">Poast!</button>
+				<h3>Add SSH Public Key</h3>
+				<form id="ssh-public-key-form">
+					<input name="ssh-public-key-name" placeholder="a-name-for-your-key" id="ssh-public-key-name" required autofocus></input>
+					<input name="ssh-public-key-service" placeholder="service-name or *" id="ssh-public-key-service" required autofocus></input>
+					<textarea name="ssh-public-key-key" placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG9BVPpCtKTckpQVk4etPSsC65Vo91Ie0kpjJH6PSdow alice@wonderland" id="ssh-public-key-key" required autofocus></textarea>
+					<button id="ssh-public-key-button">Create</button>
 				</form>
 				<br>
-				<p id="post-form-error" style="color: #E37474;"></p>
+				<p id="ssh-public-key-form-error" style="color: #E37474;"></p>
 			</article>
 
-			<!-- hidden by default, will be shown if a post has been created -->
+			<!-- hidden by default, will be shown if a ssh-public-key has been created -->
 			<article id="success-container" style="display: none;">
 				<h2>Success!</h2>
-				<p>The post record has been created on your PDS. It should be visible at:</p>
-				<ul>
-					<li>Your PDS's <a id="success-pds" href="#"><code>com.atproto.repo.getRecord</code> API</a></li>
-					<li><a id="success-bsky" href="#">The Bluesky web app</a></li>
-					<li>Independent Bluesky apps like <a id="success-blacksky" href="#">Blacksky</a></li>
-					<li>The <a id="success-pdsls" href="#">PDSls</a> AT Protocol Explorer tool</li>
-					<li>...and many other places that speak AT Protocol!</li>
-				</ul>
+				<p>The ssh-public-key record has been created on your PDS. It should be visible at: </p><a id="success-pdsls" target="_blank" href="#">PDSls link</a>
+			</article>
+
+			<article id="ssh-public-keys-list-container" style="display: none;">
+				<p>Here are your active keys and services</p>
+				<h3>Add SSH Public Key</h3>
+				<p id="ssh-public-key-form-error" style="color: #E37474;"></p>
 			</article>
 
 		</section>
