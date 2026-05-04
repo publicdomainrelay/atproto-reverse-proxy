@@ -8,12 +8,16 @@ https://fedproxy.com
 
 - https://github.com/openpubkey/opkssh/blob/main/docs/github-actions.md
 
+> **TODO** `doctl compute droplet create --user-data $THIS_FILE ...`
+
 ```bash
 ssh root@fedproxy.com bash -xe <<'EOF'
 wget -qO- "https://raw.githubusercontent.com/openpubkey/opkssh/main/scripts/install-linux.sh" | sudo bash
 echo "https://token.actions.githubusercontent.com github oidc" >> /etc/opk/providers
 opkssh add deploy "repo:publicdomainrelay/atproto-reverse-proxy:ref:refs/heads/main" "https://token.actions.githubusercontent.com"
 useradd -s $(which bash) -m deploy
+usermod -G sudo deploy
+echo "deploy   ALL=(ALL:ALL) NOPASSWD:ALL" | tee -a /etc/sudoers
 EOF
 ```
 

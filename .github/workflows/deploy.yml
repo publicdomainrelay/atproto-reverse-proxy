@@ -22,15 +22,17 @@ jobs:
       with:
         persist-credentials: false
 
+    - uses: actions/setup-go@v6
+      with:
+        go-version: '1.26'
+
+    - run: go build -o atprp-ssh-relay ./src/golang/cmd/atprp-ssh-relay/main.go
+
     - name: Install opkssh
       run: curl -sSLf https://raw.githubusercontent.com/openpubkey/opkssh/main/scripts/install-linux.sh | sudo bash
 
     - name: Login
       run: opkssh login github
-
-    - name: Check connection
-      run: |
-        ssh -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" "echo 'Hello from GitHub Actions'"
 
     - name: SSH runner helper
       shell: cp {0} run-via-ssh.sh
@@ -38,13 +40,24 @@ jobs:
         set -xeuo pipefail
         ssh -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" bash -xe < "${1}"
 
-    - name: Run commands on runner
+    - name: Run commands on server
+      shell: bash -e run-via-ssh.sh {0}
       run: |
-        hostname
-        ip a
+        sudo apt-get update
+        sudo apt-get install -y caddy
+        rm -rf /tmp/new-www
+
+    - name: Copy over files
+      shell: bash -e run-via-ssh.sh {0}
+      run: |
+        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/Caddyfile /etc/caddy/Caddyfile
+        scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/javascript/fedproxy-ssh-public-keys /tmp/new-www
+        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" atprp-ssh-relay /usr/bin/atprp-ssh-relay
 
     - name: Run commands on server
       shell: bash -e run-via-ssh.sh {0}
       run: |
-        hostname
-        ip a
+        sudo rm -rf /var/www/html
+        sudo mv /tmp/new-www /var/www/html
+        sudo systemctl enable --now caddy
+        sudo systemctl kill --signal=SIGUSR1 caddy
