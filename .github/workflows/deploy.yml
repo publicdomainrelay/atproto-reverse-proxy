@@ -64,6 +64,9 @@ jobs:
       run: |
         sudo rm -rf /var/www/html
         sudo mkdir -pv /var/www/
+        sudo mkdir -pv /opt/caddy
+        sudo chown -R caddy:caddy /opt/caddy
+
         sudo mv /tmp/fedproxy-ssh-public-keys /var/www/html
         sudo mv /tmp/stage/Caddyfile /etc/caddy/Caddyfile
         sudo mv /tmp/stage/atprp-ssh-relay /usr/bin/atprp-ssh-relay
@@ -81,7 +84,7 @@ jobs:
         ExecStart=/usr/bin/atprp-ssh-relay
         Restart=on-failure
         Environment=THIS_ENDPOINT=fedproxy.com
-        Environment=CADDY_SOCK=/tmp/caddy-admin.sock
+        Environment=CADDY_SOCK=/opt/caddy/caddy-admin.sock
         WorkingDirectory=/var/run
         RestartSec=5
 

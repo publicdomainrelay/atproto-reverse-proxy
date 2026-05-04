@@ -6,8 +6,10 @@
 # curl -v --unix-socket caddy-admin.sock http://127.0.0.1/config/ | jq
 {
 	# Expose Caddy’s admin API on a Unix socket
-  # admin unix/{env.PWD}/caddy-admin.sock
-	admin unix//tmp/caddy-admin.sock
+
+	# For local dev:
+	# admin unix/{env.PWD}/caddy-admin.sock
+	admin unix//opt/caddy/caddy-admin.sock
 	log default {
 		level debug
 	}
