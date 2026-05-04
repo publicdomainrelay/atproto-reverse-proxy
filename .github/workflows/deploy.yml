@@ -55,9 +55,9 @@ jobs:
 
     - name: Copy over files
       run: |
-        scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/javascript/fedproxy-ssh-public-keys /tmp/
-        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/Caddyfile /tmp/stage/Caddyfile
-        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/target/atprp-ssh-relay /tmp/stage/atprp-ssh-relay
+        scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/javascript/fedproxy-ssh-public-keys "${SSH_TARGET}":/tmp/
+        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/golang/Caddyfile "${SSH_TARGET}":/tmp/stage/Caddyfile
+        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/golang/target/atprp-ssh-relay "${SSH_TARGET}":/tmp/stage/atprp-ssh-relay
 
     - name: Run commands on server
       shell: bash -e run-via-ssh.sh {0}
