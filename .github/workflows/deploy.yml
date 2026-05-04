@@ -50,11 +50,12 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y caddy
         rm -rf /tmp/stage
-        rm -rf /tmp/new-www
+        rm -rf /tmp/fedproxy-ssh-public-keys
+        mkdir -p /tmp/stage
 
     - name: Copy over files
       run: |
-        scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/javascript/fedproxy-ssh-public-keys /tmp/new-www
+        scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/javascript/fedproxy-ssh-public-keys /tmp/
         scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/Caddyfile /tmp/stage/Caddyfile
         scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" src/golang/target/atprp-ssh-relay /tmp/stage/atprp-ssh-relay
 
@@ -62,7 +63,7 @@ jobs:
       shell: bash -e run-via-ssh.sh {0}
       run: |
         sudo rm -rf /var/www/html
-        sudo mv /tmp/new-www /var/www/html
+        sudo mv /tmp/fedproxy-ssh-public-keys /var/www/html
         sudo mv /tmp/stage/Caddyfile /etc/caddy/Caddyfile
         sudo mv /tmp/stage/atprp-ssh-relay /usr/bin/atprp-ssh-relay
         sudo systemctl enable --now caddy
