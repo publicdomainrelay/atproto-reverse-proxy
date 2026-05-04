@@ -14,5 +14,5 @@
 
 # Listen on a Unix socket
 https://fedproxy.com {
-	reverse_proxy unix/{env.PWD}/web-ui.sock
+	reverse_proxy http://127.0.0.1:8080 # unix/{env.PWD}/web-ui.sock
 }
