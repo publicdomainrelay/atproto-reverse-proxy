@@ -75,7 +75,7 @@ func NewGlobalState(ctx context.Context) (*GlobalState, error) {
 func NewOAuthApp(ctx context.Context, state *GlobalState) error {
 	config := oauth.NewPublicConfig(
 		fmt.Sprintf("%s/client-metadata.json", state.ThisEndpoint),
-		fmt.Sprintf("%s/oauth/callback", state.ThisEndpoint),
+		fmt.Sprintf("%s/v1/atproto/oauth/callback", state.ThisEndpoint),
 		[]string{"atproto", "repo:com.fedproxy.sshPublicKey?action=create"},
 	)
 
@@ -156,10 +156,10 @@ func realMain(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", HandleServeRoot)
+	mux.HandleFunc("GET /v1/atproto/oauth/login", HandleLogin)
+	mux.HandleFunc("GET /v1/atproto/oauth/callback", HandleOAuthCallback)
 	mux.HandleFunc("GET /client-metadata.json", HandleClientMetadata)
-	mux.HandleFunc("GET /oauth/login", HandleLogin)
-	mux.HandleFunc("GET /oauth/callback", HandleOAuthCallback)
+	mux.HandleFunc("GET /", HandleServeRoot)
 
 	handler := WithOAuthSession(state)(mux)
 
@@ -354,7 +354,7 @@ func HandleServeRoot(w http.ResponseWriter, r *http.Request) {
 	session := OAuthSessionFromContext(ctx)
 	if session == nil {
 		log.Printf("oauth session not found method=%s path=%s", r.Method, r.URL.Path)
-		http.Error(w, fmt.Sprintf("%s/oauth/login?identifier=${handle}.bsky.social", state.ThisEndpoint), http.StatusOK)
+		http.Error(w, fmt.Sprintf("%s/v1/atproto/oauth/login?identifier=${handle}.bsky.social", state.ThisEndpoint), http.StatusOK)
 		return
 	}
 
