@@ -42,7 +42,7 @@ jobs:
       shell: cp {0} run-via-ssh.sh
       run: |
         set -xeuo pipefail
-        ssh -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" bash -xe < "${1}"
+        ssh -i ~/.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" bash -xe < "${1}"
 
     - name: Run commands on server
       shell: bash -e run-via-ssh.sh {0}
@@ -55,9 +55,9 @@ jobs:
 
     - name: Copy over files
       run: |
-        scp -r -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/javascript/fedproxy-ssh-public-keys "${SSH_TARGET}":/tmp/
-        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/golang/Caddyfile "${SSH_TARGET}":/tmp/stage/Caddyfile
-        scp -i /.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/golang/target/atprp-ssh-relay "${SSH_TARGET}":/tmp/stage/atprp-ssh-relay
+        scp -r -i ~/.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/javascript/fedproxy-ssh-public-keys "${SSH_TARGET}":/tmp/
+        scp -i ~/.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/golang/Caddyfile "${SSH_TARGET}":/tmp/stage/Caddyfile
+        scp -i ~/.ssh/id_ecdsa -o StrictHostKeyChecking=accept-new src/golang/target/atprp-ssh-relay "${SSH_TARGET}":/tmp/stage/atprp-ssh-relay
 
     - name: Run commands on server
       shell: bash -e run-via-ssh.sh {0}
