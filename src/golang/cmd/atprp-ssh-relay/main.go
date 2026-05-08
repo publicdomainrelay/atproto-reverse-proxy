@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
@@ -74,6 +75,8 @@ func main() {
 			}
 			log.Printf("Got ssh public keys for user=%s sshPublicKeys=%+v", c.User(), sshPublicKeys)
 
+			services := make([]string, 0)
+
 			for _, sshPublicKey := range sshPublicKeys {
 				authorizedKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(sshPublicKey.Key))
 				if err != nil {
@@ -83,14 +86,17 @@ func main() {
 
 				if string(authorizedKey.Marshal()) == string(pubKey.Marshal()) {
 					log.Printf("key is valid for service=%s", sshPublicKey.Service)
-					return &ssh.Permissions{
-						// Record the public key used for authentication.
-						Extensions: map[string]string{
-							"pubkey-fp":                ssh.FingerprintSHA256(pubKey),
-							"pubkey-valid-for-service": sshPublicKey.Service,
-						},
-					}, nil
+					services = append(services, sshPublicKey.Service)
 				}
+			}
+			if len(services) > 0 {
+				return &ssh.Permissions{
+					// Record the public key used for authentication.
+					Extensions: map[string]string{
+						"pubkey-fp":                 ssh.FingerprintSHA256(pubKey),
+						"pubkey-valid-for-services": strings.Join(services, ","),
+					},
+				}, nil
 			}
 			return nil, fmt.Errorf("unknown public key for %q", c.User())
 		},
@@ -186,9 +192,16 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 			localPath := filepath.Join(tmpDir, base)
 			log.Printf("📨 tcpip-forward request: %s:%d → local=%s", p.BindAddr, p.BindPort, localPath)
 
-			pubkeyValidForService := serverConn.Permissions.Extensions["pubkey-valid-for-service"]
-			if pubkeyValidForService != "*" && pubkeyValidForService != p.BindAddr {
-				log.Printf("public key not valid for service=%s is valid_for=%s", p.BindAddr, pubkeyValidForService)
+			pubkeyValidForServices := strings.Split(serverConn.Permissions.Extensions["pubkey-valid-for-services"], ",")
+			found := false
+			for _, pubkeyValidForService := range pubkeyValidForServices {
+				if pubkeyValidForService == "*" || pubkeyValidForService == p.BindAddr {
+					found = true
+					break
+				}
+			}
+			if !found {
+				log.Printf("public key not valid for service=%s is valid_for=%+v", p.BindAddr, pubkeyValidForServices)
 				req.Reply(false, nil)
 				continue
 			}
