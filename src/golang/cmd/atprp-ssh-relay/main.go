@@ -320,6 +320,11 @@ func getCaddyClient(caddySockPath string) *http.Client {
 }
 
 // ensureSrv0Exists checks if srv0 is initialized and creates it if not.
+// When CF_API_TOKEN is set, it also installs a wildcard catch-all route in
+// srv0 plus a TLS automation policy that issues certs on-demand via the
+// Cloudflare DNS-01 challenge. With this policy, caddy can mint certs for
+// any depth of subdomain under THIS_ENDPOINT — the on_demand_tls.ask gate
+// (configured in the Caddyfile) decides which names are actually allowed.
 func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 	checkReq, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1/config/apps/http/servers/srv0", nil)
 	resp, err := client.Do(checkReq)
@@ -327,7 +332,7 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 		defer resp.Body.Close()
 		log.Printf("caddy check srv0 resp.StatusCode=%s", resp.StatusCode)
 		if resp.StatusCode == http.StatusOK {
-			return nil
+			return ensureWildcardCatchAll(ctx, client)
 		}
 	}
 	log.Println("caddy creating srv0...")
@@ -352,6 +357,166 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 	}
 	defer setupResp.Body.Close()
 	log.Println("created srv0")
+	return ensureWildcardCatchAll(ctx, client)
+}
+
+// ensureWildcardCatchAll installs the wildcard catch-all route in srv0 and
+// the matching default TLS automation policy. No-op when CF_API_TOKEN is
+// unset (DNS-01 needs the Cloudflare token; without it we fall back to
+// per-name HTTP-01 issuance and don't need a wildcard policy).
+func ensureWildcardCatchAll(ctx context.Context, client *http.Client) error {
+	cfToken := os.Getenv("CF_API_TOKEN")
+	if cfToken == "" {
+		return nil
+	}
+	thisEndpoint := os.Getenv("THIS_ENDPOINT")
+	if thisEndpoint == "" {
+		return fmt.Errorf("THIS_ENDPOINT must be set")
+	}
+
+	// Default automation policy (no `subjects`) so any depth of subdomain
+	// is covered. The on_demand_tls.ask endpoint is the actual filter.
+	policyID := "tls-policy-wildcard-" + thisEndpoint
+	policy := map[string]any{
+		"@id":       policyID,
+		"on_demand": true,
+		"issuers": []map[string]any{
+			{
+				"module": "acme",
+				"challenges": map[string]any{
+					"dns": map[string]any{
+						"provider": map[string]any{
+							"name":      "cloudflare",
+							"api_token": cfToken,
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := upsertAutomationPolicy(ctx, client, policyID, policy); err != nil {
+		return errors.Wrap(err, "ensure tls automation policy")
+	}
+
+	// Append the wildcard catch-all route to srv0. New per-FQDN routes
+	// are inserted at index 0 by configureNewForward, so this entry stays
+	// at the tail and only matches when nothing more specific does.
+	routeID := "route-wildcard-catchall-" + thisEndpoint
+	route := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{
+			{"host": []string{"*." + thisEndpoint}},
+		},
+		"handle": []map[string]any{
+			{
+				"handler":     "static_response",
+				"status_code": 404,
+				"body":        "no route configured for host\n",
+			},
+		},
+		"terminal": true,
+	}
+	if err := upsertByID(ctx, client, routeID,
+		"http://127.0.0.1/config/apps/http/servers/srv0/routes", route); err != nil {
+		return errors.Wrap(err, "ensure wildcard catch-all route")
+	}
+	return nil
+}
+
+// upsertAutomationPolicy idempotently inserts or replaces an automation
+// policy in `apps/tls/automation/policies`. POST-append is unreliable here
+// because the path may not yet exist as an array (Caddyfile-derived configs
+// often omit it), so we read-modify-write: GET the current array, drop any
+// element with the same @id, append ours, PUT the whole array back. Existing
+// policies are kept byte-for-byte via json.RawMessage.
+func upsertAutomationPolicy(ctx context.Context, client *http.Client, id string, policy map[string]any) error {
+	const url = "http://127.0.0.1/config/apps/tls/automation/policies"
+
+	var existing []json.RawMessage
+	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return errors.Wrap(err, "build get policies request")
+	}
+	if resp, err := client.Do(getReq); err == nil {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		trimmed := strings.TrimSpace(string(data))
+		if resp.StatusCode == http.StatusOK && trimmed != "" && trimmed != "null" {
+			if err := json.Unmarshal(data, &existing); err != nil {
+				return errors.Wrap(err, "decode existing policies")
+			}
+		}
+	}
+
+	filtered := make([]json.RawMessage, 0, len(existing)+1)
+	for _, raw := range existing {
+		var peek struct {
+			ID string `json:"@id"`
+		}
+		_ = json.Unmarshal(raw, &peek)
+		if peek.ID == id {
+			continue
+		}
+		filtered = append(filtered, raw)
+	}
+	ourBytes, err := json.Marshal(policy)
+	if err != nil {
+		return errors.Wrap(err, "marshal policy")
+	}
+	filtered = append(filtered, ourBytes)
+
+	body, err := json.Marshal(filtered)
+	if err != nil {
+		return errors.Wrap(err, "marshal policies array")
+	}
+	putReq, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrap(err, "build put policies request")
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(putReq)
+	if err != nil {
+		return errors.Wrap(err, "put policies")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// upsertByID DELETEs any existing config object with the given @id, then
+// POSTs the payload to arrayURL (which must be an array path; POST appends).
+// A 404 on DELETE is fine — it just means the object doesn't exist yet.
+func upsertByID(ctx context.Context, client *http.Client, id, arrayURL string, payload any) error {
+	delReq, err := http.NewRequestWithContext(ctx, "DELETE", "http://127.0.0.1/id/"+id, nil)
+	if err != nil {
+		return errors.Wrap(err, "build delete request")
+	}
+	if delResp, err := client.Do(delReq); err == nil {
+		io.Copy(io.Discard, delResp.Body)
+		delResp.Body.Close()
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return errors.Wrap(err, "marshal payload")
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", arrayURL, bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrap(err, "build post request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "post payload")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned %d: %s", resp.StatusCode, string(respBody))
+	}
 	return nil
 }
 
@@ -414,13 +579,15 @@ func configureNewForward(ctx context.Context, f *forward) error {
 		deleteResp.Body.Close()
 	}
 
-	// 2. Append the new route
+	// 2. Insert the new route at index 0 so it matches before the wildcard
+	// catch-all defined in the Caddyfile (`*.fedproxy.com, https://`),
+	// which is terminal and would otherwise swallow the request.
 	body, err := json.Marshal(routePayload)
 	if err != nil {
 		return errors.Wrap(err, "failed to marshal route payload")
 	}
 
-	reqPath := "http://127.0.0.1/config/apps/http/servers/srv0/routes"
+	reqPath := "http://127.0.0.1/config/apps/http/servers/srv0/routes/0"
 	req, err := http.NewRequestWithContext(ctx, "POST", reqPath, bytes.NewReader(body))
 	if err != nil {
 		return errors.Wrap(err, "failed to create post request")

@@ -2,10 +2,11 @@
 # sudo -E caddy run --config Caddyfile
 #
 # ssh -NnT -p 2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o PasswordAuthentication=no -R spindle-0001:80:127.0.0.1:8080 johnandersen777.bsky.social@localhost
-# clear; rm -rf /tmp/ssh-fwd-*; THIS_ENDPOINT=fedproxy.com CADDY_SOCK=${PWD}/caddy-admin.sock go run cmd/atprp-ssh-relay/main.go
+# clear; rm -rf /tmp/ssh-fwd-*; THIS_ENDPOINT=fedproxy.com CADDY_SOCK=${PWD}/caddy-admin.sock CF_API_TOKEN=... go run cmd/atprp-ssh-relay/main.go
+# CADDY_SOCK=${PWD}/caddy-admin.sock LISTEN_ADDR=127.0.0.1:5555 go run cmd/caddy-check-dns-from-config/main.go
 # curl -v --unix-socket caddy-admin.sock http://127.0.0.1/config/ | jq
 {
-	# Expose Caddy’s admin API on a Unix socket
+	# Expose Caddy's admin API on a Unix socket
 
 	# For local dev:
 	# admin unix/{env.PWD}/caddy-admin.sock
@@ -13,12 +14,28 @@
 	log default {
 		level debug
 	}
+
+	# On-demand TLS gating: caddy-check-dns-from-config inspects the live
+	# Caddy config via the admin socket and only authorizes cert issuance
+	# for FQDNs that have a matching route registered (either by static
+	# Caddyfile entries below or appended via the admin API by
+	# atprp-ssh-relay). Caddy's `ask` HTTP client cannot dial Unix
+	# sockets, so this is loopback TCP.
+	on_demand_tls {
+		ask http://127.0.0.1:5555/check
+	}
 }
 
-# Web UI
+# Web UI. Wildcard catch-all + DNS-01 issuance is configured dynamically
+# by atprp-ssh-relay's ensureSrv0Exists when CF_API_TOKEN is set.
 https://fedproxy.com {
 	file_server {
 		root /var/www/html
 		index index.html
 	}
+}
+
+# OAuth Workload Identity Reverse Proxy
+https://rp.fedproxy.com {
+	reverse_proxy unix//opt/caddy/web-ui.sock
 }
