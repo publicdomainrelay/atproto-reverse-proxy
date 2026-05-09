@@ -427,12 +427,14 @@ func ensureWildcardCatchAll(ctx context.Context, client *http.Client) error {
 // policy in `apps/tls/automation/policies`. POST-append is unreliable here
 // because the path may not yet exist as an array (Caddyfile-derived configs
 // often omit it), so we read-modify-write: GET the current array, drop any
-// element with the same @id, append ours, PUT the whole array back. Existing
-// policies are kept byte-for-byte via json.RawMessage.
+// element with the same @id, append ours, then PATCH (when the path exists)
+// or PUT (when it doesn't) the whole array back. Existing policies are kept
+// byte-for-byte via json.RawMessage.
 func upsertAutomationPolicy(ctx context.Context, client *http.Client, id string, policy map[string]any) error {
 	const url = "http://127.0.0.1/config/apps/tls/automation/policies"
 
 	var existing []json.RawMessage
+	pathExists := false
 	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return errors.Wrap(err, "build get policies request")
@@ -442,6 +444,7 @@ func upsertAutomationPolicy(ctx context.Context, client *http.Client, id string,
 		resp.Body.Close()
 		trimmed := strings.TrimSpace(string(data))
 		if resp.StatusCode == http.StatusOK && trimmed != "" && trimmed != "null" {
+			pathExists = true
 			if err := json.Unmarshal(data, &existing); err != nil {
 				return errors.Wrap(err, "decode existing policies")
 			}
@@ -469,14 +472,20 @@ func upsertAutomationPolicy(ctx context.Context, client *http.Client, id string,
 	if err != nil {
 		return errors.Wrap(err, "marshal policies array")
 	}
-	putReq, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewReader(body))
-	if err != nil {
-		return errors.Wrap(err, "build put policies request")
+	// PATCH replaces an existing value; PUT creates one (and 409s if the
+	// path already exists). Pick based on whether GET found anything.
+	method := "PUT"
+	if pathExists {
+		method = "PATCH"
 	}
-	putReq.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(putReq)
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
-		return errors.Wrap(err, "put policies")
+		return errors.Wrap(err, "build policies request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "write policies")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
