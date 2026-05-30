@@ -607,29 +607,63 @@ var httpMethodCapability = map[string]string{
 // ATProto: fetch RBAC record from PDS
 // ---------------------------------------------------------------------------
 
-// getRBACRecord fetches the latest com.fedproxy.rbac record for did from
-// pdsURL. reverse=true means the first result is the most recently created.
+// getRBACRecord paginates over all com.fedproxy.rbac records for did from
+// pdsURL and merges them into a single RBACRecord by name-keyed join.
 func getRBACRecord(ctx context.Context, pdsURL, did string) (*RBACRecord, error) {
 	pds := &xrpc.Client{Host: pdsURL}
 
-	out, err := agnostic.RepoListRecords(ctx, pds, "com.fedproxy.rbac", "", 1, did, true)
-	if err != nil {
-		return nil, errors.Wrapf(err, "RepoListRecords pds=%s did=%s", pdsURL, did)
+	joined := &RBACRecord{
+		Policies: make(map[string]RBACPolicy),
+		Roles:    make(map[string]RBACRole),
 	}
-	if len(out.Records) == 0 || out.Records[0] == nil || out.Records[0].Value == nil {
+
+	cursor := ""
+	total := 0
+	for {
+		out, err := agnostic.RepoListRecords(ctx, pds, "com.fedproxy.rbac", cursor, 100, did, false)
+		if err != nil {
+			return nil, errors.Wrapf(err, "RepoListRecords pds=%s did=%s cursor=%s", pdsURL, did, cursor)
+		}
+
+		for _, rec := range out.Records {
+			if rec == nil || rec.Value == nil {
+				continue
+			}
+			var rbac RBACRecord
+			if err := json.Unmarshal(*rec.Value, &rbac); err != nil {
+				return nil, errors.Wrapf(err, "unmarshal RBACRecord uri=%s", rec.Uri)
+			}
+			for name, policy := range rbac.Policies {
+				joined.Policies[name] = policy
+			}
+			for name, role := range rbac.Roles {
+				joined.Roles[name] = role
+			}
+			total++
+		}
+
+		if out.Cursor == nil || *out.Cursor == "" {
+			break
+		}
+		cursor = *out.Cursor
+	}
+
+	if total == 0 {
 		return nil, fmt.Errorf("no com.fedproxy.rbac record found for did=%s", did)
 	}
 
-	rec := out.Records[0]
-	var rbac RBACRecord
-	if err := json.Unmarshal(*rec.Value, &rbac); err != nil {
-		return nil, errors.Wrapf(err, "unmarshal RBACRecord uri=%s", rec.Uri)
+	roleNames := make([]string, 0, len(joined.Roles))
+	for name := range joined.Roles {
+		roleNames = append(roleNames, name)
 	}
+	policyNames := make([]string, 0, len(joined.Policies))
+	for name := range joined.Policies {
+		policyNames = append(policyNames, name)
+	}
+	log.Printf("loaded com.fedproxy.rbac did=%s records=%d roles=%v policies=%v",
+		did, total, roleNames, policyNames)
 
-	log.Printf("loaded com.fedproxy.rbac uri=%s did=%s roles=%d policies=%d",
-		rec.Uri, did, len(rbac.Roles), len(rbac.Policies))
-
-	return &rbac, nil
+	return joined, nil
 }
 
 // resolvePDS resolves a DID to its PDS endpoint URL via the ATProto identity
