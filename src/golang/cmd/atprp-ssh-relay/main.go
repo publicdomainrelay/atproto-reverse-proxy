@@ -300,7 +300,7 @@ func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TC
 	payload := ssh.Marshal(TCPIPForward{
 		BindAddr:   f.BindAddr,
 		BindPort:   f.BindPort,
-		OriginAddr: f.BindAddr,
+		OriginAddr: "127.0.0.1",
 		OriginPort: f.BindPort,
 	})
 
@@ -351,7 +351,7 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 
 	// Initialize the standard server structure if srv0 is missing
 	srvPayload := map[string]any{
-		"listen": []string{":443"}, // e.g. ":443" or a unix socket
+		"listen": []string{":443"},
 		"routes": []any{},
 	}
 
@@ -628,6 +628,21 @@ func configureNewForward(ctx context.Context, f *forward) error {
 		if resp.StatusCode >= 300 {
 			respBody, _ := io.ReadAll(resp.Body)
 			return fmt.Errorf("caddy returned non-success status %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		// Kick off background cert issuance immediately so DNS-01 completes
+		// before the first client connects, avoiding a 30-90 s handshake stall.
+		if body, err := json.Marshal([]string{fqdn}); err == nil {
+			if automateReq, err := http.NewRequestWithContext(ctx, "POST",
+				"http://127.0.0.1/config/apps/tls/certificates/automate",
+				bytes.NewReader(body)); err == nil {
+				automateReq.Header.Set("Content-Type", "application/json")
+				if r, err := client.Do(automateReq); err == nil {
+					io.Copy(io.Discard, r.Body)
+					r.Body.Close()
+					log.Printf("🔐 triggered background cert issuance for %s", fqdn)
+				}
+			}
 		}
 	}
 
