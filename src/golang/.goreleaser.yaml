@@ -77,6 +77,7 @@ archives:
       - goos: windows
         format: zip
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    allow_different_binary_count: true
 
 checksum:
   name_template: checksums.txt
