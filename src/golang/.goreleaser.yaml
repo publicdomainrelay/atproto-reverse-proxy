@@ -1,0 +1,99 @@
+version: 2
+
+project_name: atproto-reverse-proxy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: atprp-ssh-relay
+    main: ./cmd/atprp-ssh-relay
+    binary: atprp-ssh-relay
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: caddy-check-dns-from-config
+    main: ./cmd/caddy-check-dns-from-config
+    binary: caddy-check-dns-from-config
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: fedproxy-client
+    main: ./cmd/fedproxy-client
+    binary: fedproxy-client
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: oauth-client-webapp
+    main: ./cmd/oauth-client-webapp
+    binary: oauth-client-webapp
+    env:
+      - CGO_ENABLED=1
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    overrides:
+      - goos: linux
+        goarch: amd64
+        env:
+          - CGO_ENABLED=1
+          - CC=zig cc -target x86_64-linux-musl
+          - CXX=zig c++ -target x86_64-linux-musl
+      - goos: linux
+        goarch: arm64
+        env:
+          - CGO_ENABLED=1
+          - CC=zig cc -target aarch64-linux-musl
+          - CXX=zig c++ -target aarch64-linux-musl
+      - goos: darwin
+        goarch: amd64
+        env:
+          - CGO_ENABLED=1
+          - CC=zig cc -target x86_64-macos
+          - CXX=zig c++ -target x86_64-macos
+      - goos: darwin
+        goarch: arm64
+        env:
+          - CGO_ENABLED=1
+          - CC=zig cc -target aarch64-macos
+          - CXX=zig c++ -target aarch64-macos
+
+archives:
+  - id: default
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  make_latest: true
+  replace_existing_draft: true
