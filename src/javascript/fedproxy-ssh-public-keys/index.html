@@ -52,8 +52,16 @@
 
 			<article id="ssh-public-key-instructions">
 				<h3>Instructions</h3>
-				<p>Add ssh keys for the services you want to proxy to.</p>
-				<p>Then start ssh client (example of forwarding <code>my-cool-service.handle.example.com.fedproxy.com</code> to port <code>8080</code> locally):</p>
+				<p>Add an SSH key for each service you want to expose. Each service is reachable at:</p>
+				<p><code>&lt;service&gt;--&lt;your-handle&gt;.fedproxy.com</code> — the service name and your handle are folded into one label, with every dot in your handle turned into a dash.</p>
+				<p>Example: service <code>my-cool-service</code> for handle <code>handle.example.com</code> is served at <code>my-cool-service--handle-example-com.fedproxy.com</code>. Every service rides one shared <code>*.fedproxy.com</code> wildcard certificate, so HTTPS works the moment you connect — no per-service certificate is issued.</p>
+				<p>The <strong>service</strong> field accepts:</p>
+				<ul>
+					<li><code>my-cool-service</code> — a single service host.</li>
+					<li><code>*</code> — this key is valid for <em>all</em> of your services (an authorization wildcard, not a hostname).</li>
+					<li><code>*.my-cool-service</code> — a wildcard subdomain: serves any <code>anything.my-cool-service--&lt;handle&gt;.fedproxy.com</code>. This one gets its own certificate issued on demand.</li>
+				</ul>
+				<p>Then start the ssh client (example forwarding <code>my-cool-service--handle-example-com.fedproxy.com</code> to local port <code>8080</code>):</p>
         <pre id="example-ssh-command">
 
 ssh -NnT -p 2222 \
@@ -94,7 +102,7 @@ ssh -NnT -p 2222 \
 				<h3>Add SSH Public Key</h3>
 				<form id="ssh-public-key-form">
 					<input name="ssh-public-key-name" placeholder="a-name-for-your-key" id="ssh-public-key-name" required autofocus></input>
-					<input name="ssh-public-key-service" placeholder="service-name or *" id="ssh-public-key-service" required autofocus></input>
+					<input name="ssh-public-key-service" placeholder="service-name, * (all), or *.service-name (wildcard)" id="ssh-public-key-service" required autofocus></input>
 					<textarea name="ssh-public-key-key" placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG9BVPpCtKTckpQVk4etPSsC65Vo91Ie0kpjJH6PSdow alice@wonderland" id="ssh-public-key-key" required autofocus></textarea>
 					<button id="ssh-public-key-button">Create</button>
 				</form>

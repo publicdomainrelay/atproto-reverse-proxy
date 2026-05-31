@@ -16,6 +16,31 @@ const clientId = buildClientID();
 
 let oac; // undefined | BrowserOAuthClient
 let agent; // undefined | Agent   (gets assigned after successful auth)
+let sessionHandle; // undefined | string  (logged-in handle, for building hostnames)
+
+// serviceHostname returns the public host a service is reachable at.
+//
+// The service name and your handle are folded into a SINGLE DNS label: dots
+// become dashes and the two are joined by "--". That keeps every service exactly
+// one level under fedproxy.com, so it is covered by the one shared
+// "*.fedproxy.com" wildcard certificate — HTTPS works the instant you connect
+// and NO per-service certificate is ever issued (which is what kept hitting the
+// Let's Encrypt rate limit).
+//
+//   service "app"        handle "alice.bsky.social"
+//     -> app--alice-bsky-social.fedproxy.com
+//   service "*.app"      handle "alice.bsky.social"   (explicit wildcard)
+//     -> *.app--alice-bsky-social.fedproxy.com   (matches any sub-host)
+//
+// A bare "*" service means "this key is valid for ALL of your services" — it is
+// an authorization wildcard, not a hostname.
+function serviceHostname(service, handle) {
+	const flat = (s) => s.replace(/\./g, "-");
+	if (service.startsWith("*.")) {
+		return `*.${flat(service.slice(2))}--${flat(handle)}.fedproxy.com`;
+	}
+	return `${flat(service)}--${flat(handle)}.fedproxy.com`;
+}
 
 // Helper function to fetch and render SSH Keys securely
 async function fetchAndRenderKeys(handle) {
@@ -66,14 +91,20 @@ async function fetchAndRenderKeys(handle) {
 			const article = document.createElement('article');
 
 			const serviceHeader = document.createElement('h3');
-			if (service !== "*") {
+			if (service === "*") {
+				// Auth wildcard: key valid for every service, not a host itself.
+				serviceHeader.textContent = "* (key valid for all your services)";
+			} else if (service.startsWith("*.")) {
+				// Explicit wildcard subdomain: matches any sub-host, so not a
+				// single clickable link. Show the host pattern it serves.
+				serviceHeader.textContent = serviceHostname(service, handle);
+			} else {
+				const host = serviceHostname(service, handle);
 				const serviceLink = document.createElement('a');
 				serviceLink.setAttribute("target", "_blank");
-				serviceLink.href = `https://${service}.${handle}.fedproxy.com`;
-				serviceLink.textContent  = service;
+				serviceLink.href = `https://${host}`;
+				serviceLink.textContent = host;
 				serviceHeader.appendChild(serviceLink)
-			} else {
-				serviceHeader.textContent = "*";
 			}
 
 			const exampleSSHCommandTemplate = document.getElementById("example-ssh-command").textContent;
@@ -84,9 +115,14 @@ async function fetchAndRenderKeys(handle) {
 				handle,
 			);
 			if (service !== "*") {
+				// Substitute the real service into the "-R <bind>:..." spec. A
+				// wildcard bind ("*.app") contains a glob the shell would expand,
+				// so single-quote the whole forward spec. Preserve whatever
+				// "<port>:<host>:<port>" tail the template carries.
+				const needsQuote = service.startsWith("*.");
 				exampleSSHCommand.textContent = exampleSSHCommand.textContent.replace(
-					/my-cool-service/g,
-					service,
+					/-R my-cool-service(\S*)/,
+					(_m, rest) => needsQuote ? `-R '${service}${rest}'` : `-R ${service}${rest}`,
 				);
 			}
 
@@ -191,6 +227,7 @@ async function init() {
 				throw new Error(JSON.stringify(res));
 			}
 
+			sessionHandle = res.data.handle;
 			document.getElementById("welcome-message").innerText = `@${res.data.handle}`;
 			document.getElementById("ssh-public-key-container").style.display = "inherit"; // unhide
 			document.getElementById("ssh-public-keys-list-container").style.display = "inherit"; // unhide list section
@@ -263,7 +300,7 @@ async function doPost(name, service, key) {
 	document.getElementById("success-container").style.display = "inherit"; // unhide
 
 	// Refetch the keys so the new one appears in the list directly below
-	await fetchAndRenderKeys();
+	await fetchAndRenderKeys(sessionHandle);
 
 	// Reset the form so they can easily create another one
 	document.getElementById("ssh-public-key-form").reset();

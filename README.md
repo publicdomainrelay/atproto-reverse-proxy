@@ -2,6 +2,41 @@
 
 https://fedproxy.com
 
+## How service hostnames work
+
+Each service you expose is reachable at a single flattened hostname:
+
+```
+<service>--<your-handle>.fedproxy.com
+```
+
+The service name and your handle are folded into **one** DNS label: every dot in
+your handle becomes a dash, and the two are joined with `--`. For example,
+service `my-cool-service` registered by handle `alice.bsky.social` is served at:
+
+```
+my-cool-service--alice-bsky-social.fedproxy.com
+```
+
+Folding everything into one label keeps every service exactly one level under
+`fedproxy.com`, so they are all covered by a **single shared `*.fedproxy.com`
+wildcard certificate** (issued once via the Cloudflare DNS-01 challenge). HTTPS
+works the instant a service connects, and we never issue a certificate per
+service — which is what previously exhausted the ACME (Let's Encrypt) rate
+limit.
+
+The `service` value in a `com.fedproxy.sshPublicKey` record may be:
+
+| Value | Meaning |
+| --- | --- |
+| `my-cool-service` | A single service host (`my-cool-service--<handle>.fedproxy.com`). |
+| `*` | The key authorizes **all** of your services (authorization wildcard, not a hostname). |
+| `*.my-cool-service` | A wildcard subdomain: serves any `anything.my-cool-service--<handle>.fedproxy.com`. This is the one case that issues its own certificate on demand (gated by `on_demand_tls`), since it falls outside the shared `*.fedproxy.com` wildcard. |
+
+This requires a wildcard `*.fedproxy.com` DNS record pointing at the box and a
+`CF_API_TOKEN` with edit rights on the `fedproxy.com` Cloudflare zone (for the
+DNS-01 challenge).
+
 ## Auto Domain on Boot
 
 Could be combined with https://github.com/digitalocean-labs/droplet-oidc-poc/tree/main#atproto-login-and-rbac-configuration to automate getting a Droplet a resolvable domain after boot and doing service discovery via ATProto, or etc by:
@@ -14,7 +49,7 @@ Could be combined with https://github.com/digitalocean-labs/droplet-oidc-poc/tre
 
 - `curl` down the systemd service file (**TODO**)
 
-- Have the Droplet `systemctl enable --now my-cool-sevice.handle.example.com@fedproxy.service`
+- Have the Droplet `systemctl enable --now my-cool-service--handle-example-com@fedproxy.service`
 
 <img width="1490" height="2284" alt="Screenshot From 2026-05-03 18-39-52" src="https://github.com/user-attachments/assets/a9883a6f-eb0a-494f-8560-e05d1851f941" />
 
@@ -53,7 +88,7 @@ EOF
 
 - atrprp.chadig.com
 
-  - service.handle.com.atrprp.chadig.com
+  - service--handle-com.atrprp.chadig.com
 
 - sh.tagled.publicKey
 
@@ -77,7 +112,7 @@ EOF
 
 - proxy gets request over ssh
 
-  - splits service.handle.com
+  - folds service + handle into one label (`service--handle`) under fedproxy.com
 
   - resolves service records
 

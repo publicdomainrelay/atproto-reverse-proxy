@@ -45,6 +45,17 @@ type forward struct {
 	userHandle  string
 }
 
+// reg tracks every forward currently established so the reconcile loop can
+// re-push its Caddy routes if Caddy is restarted out from under us (e.g. by a
+// deploy), which wipes all dynamically-pushed config. Keyed by
+// serviceName + "\x00" + userHandle (the same identity a route @id derives from).
+var (
+	regMu sync.Mutex
+	reg   = map[string]*forward{}
+)
+
+func forwardKey(f *forward) string { return f.serviceName + "\x00" + f.userHandle }
+
 func main() {
 	log.Println("▶️ Starting SSH-forward server")
 
@@ -109,6 +120,18 @@ func main() {
 		log.Fatalf("❌ listen tcp: %v", err)
 	}
 	log.Println("✅ SSH listening on :2222")
+
+	// Install the wildcard DNS-01 on_demand policy + catch-all immediately and
+	// keep them (plus every active forward's route) alive. Without this the
+	// DNS-01 policy only existed after the first forward connected, and any
+	// Caddy restart silently dropped all dynamic config until clients happened
+	// to reconnect — leaving on-demand cert issuance dead in the meantime.
+	if caddySock := os.Getenv("CADDY_SOCK"); caddySock != "" {
+		go reconcileLoop(getCaddyClient(caddySock))
+		log.Println("♻️ started Caddy reconcile loop")
+	} else {
+		log.Println("⚠️ CADDY_SOCK unset — Caddy reconciliation disabled")
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -332,11 +355,17 @@ func getCaddyClient(caddySockPath string) *http.Client {
 }
 
 // ensureSrv0Exists checks if srv0 is initialized and creates it if not.
-// When CF_API_TOKEN is set, it also installs a wildcard catch-all route in
-// srv0 plus a TLS automation policy that issues certs on-demand via the
-// Cloudflare DNS-01 challenge. With this policy, caddy can mint certs for
-// any depth of subdomain under THIS_ENDPOINT — the on_demand_tls.ask gate
-// (configured in the Caddyfile) decides which names are actually allowed.
+// When CF_API_TOKEN is set, it also installs the TLS automation policy that
+// manages a SINGLE "*.THIS_ENDPOINT" wildcard cert via the Cloudflare DNS-01
+// challenge. Every normal service is served under one flattened label
+// (svc--handle.THIS_ENDPOINT), so that one wildcard cert covers them all and
+// no per-name issuance happens. The policy also keeps on_demand enabled as a
+// fallback (gated by on_demand_tls.ask) for explicit "*.service" child
+// wildcards not covered by the shared cert.
+//
+// Note: the wildcard catch-all route is NOT installed here. Callers must call
+// ensureCatchAllRoute after all per-forward routes have been appended so that
+// the catch-all always sorts last.
 func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 	checkReq, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1/config/apps/http/servers/srv0", nil)
 	resp, err := client.Do(checkReq)
@@ -344,7 +373,7 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 		defer resp.Body.Close()
 		log.Printf("caddy check srv0 resp.StatusCode=%s", resp.StatusCode)
 		if resp.StatusCode == http.StatusOK {
-			return ensureWildcardCatchAll(ctx, client)
+			return ensureWildcardTLSPolicy(ctx, client)
 		}
 	}
 	log.Println("caddy creating srv0...")
@@ -369,14 +398,14 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 	}
 	defer setupResp.Body.Close()
 	log.Println("created srv0")
-	return ensureWildcardCatchAll(ctx, client)
+	return ensureWildcardTLSPolicy(ctx, client)
 }
 
-// ensureWildcardCatchAll installs the wildcard catch-all route in srv0 and
-// the matching default TLS automation policy. No-op when CF_API_TOKEN is
-// unset (DNS-01 needs the Cloudflare token; without it we fall back to
-// per-name HTTP-01 issuance and don't need a wildcard policy).
-func ensureWildcardCatchAll(ctx context.Context, client *http.Client) error {
+// ensureWildcardTLSPolicy installs the DNS-01 TLS automation policy and
+// triggers issuance of the shared "*.<endpoint>" wildcard cert. No-op when
+// CF_API_TOKEN is unset. Does NOT touch the catch-all route — call
+// ensureCatchAllRoute separately, after all per-forward routes are in place.
+func ensureWildcardTLSPolicy(ctx context.Context, client *http.Client) error {
 	cfToken := os.Getenv("CF_API_TOKEN")
 	if cfToken == "" {
 		return nil
@@ -386,9 +415,20 @@ func ensureWildcardCatchAll(ctx context.Context, client *http.Client) error {
 		return fmt.Errorf("THIS_ENDPOINT must be set")
 	}
 
-	// Default automation policy (no `subjects`) so any depth of subdomain
-	// is covered. The on_demand_tls.ask endpoint is the actual filter.
 	policyID := "tls-policy-wildcard-" + thisEndpoint
+	wildcard := "*." + thisEndpoint
+
+	// Fast path: policy already present, nothing to write.
+	if idExists(ctx, client, policyID) {
+		return nil
+	}
+
+	// One DNS-01 (Cloudflare) automation policy, subject-less so it's Caddy's
+	// default issuer. on_demand stays enabled as a FALLBACK — gated by
+	// on_demand_tls.ask — for names not covered by the shared wildcard, e.g. an
+	// explicit "*.service" child wildcard. Normal flattened hosts never reach
+	// on_demand: the shared "*.<endpoint>" wildcard cert (automated just below)
+	// is already loaded and served for them, so no per-name ACME happens.
 	policy := map[string]any{
 		"@id":       policyID,
 		"on_demand": true,
@@ -410,9 +450,28 @@ func ensureWildcardCatchAll(ctx context.Context, client *http.Client) error {
 		return errors.Wrap(err, "ensure tls automation policy")
 	}
 
-	// Append the wildcard catch-all route to srv0. New per-FQDN routes
-	// are inserted at index 0 by configureNewForward, so this entry stays
-	// at the tail and only matches when nothing more specific does.
+	// Proactively manage the ONE shared wildcard cert so every flattened
+	// svc--handle host is served from it (no per-name ACME).
+	triggerCertIssuance(ctx, client, wildcard)
+	return nil
+}
+
+// ensureCatchAllRoute appends (or re-appends) the wildcard catch-all 404 route
+// to the END of srv0's routes array. It unconditionally deletes any existing
+// copy first, then re-appends, so the catch-all always sorts after every
+// per-forward route regardless of insertion order. Callers must invoke this
+// AFTER all per-forward routes have been pushed for a given operation.
+// No-op when CF_API_TOKEN or THIS_ENDPOINT is unset.
+func ensureCatchAllRoute(ctx context.Context, client *http.Client) error {
+	cfToken := os.Getenv("CF_API_TOKEN")
+	if cfToken == "" {
+		return nil
+	}
+	thisEndpoint := os.Getenv("THIS_ENDPOINT")
+	if thisEndpoint == "" {
+		return fmt.Errorf("THIS_ENDPOINT must be set")
+	}
+
 	routeID := "route-wildcard-catchall-" + thisEndpoint
 	route := map[string]any{
 		"@id": routeID,
@@ -541,112 +600,235 @@ func upsertByID(ctx context.Context, client *http.Client, id, arrayURL string, p
 	return nil
 }
 
+// flattenLabel folds an identity part that may contain dots (a handle like
+// "alice.bsky.social", or a dotted service name) into a single DNS label by
+// replacing each dot with a dash.
+func flattenLabel(s string) string { return strings.ReplaceAll(s, ".", "-") }
+
+// serviceLabel builds the flattened single DNS label "<service>--<handle>"
+// (dots -> dashes). Folding the whole identity into one label (instead of
+// "<service>.<handle>.<endpoint>") puts the host exactly one level under
+// <endpoint>, so it is covered by the single shared "*.<endpoint>" wildcard
+// cert and needs no per-name ACME. The "--" separator keeps service and handle
+// visually distinct. A DNS label is capped at 63 chars; configureNewForward
+// rejects forwards whose label would exceed that.
+func serviceLabel(service, handle string) string {
+	return flattenLabel(service) + "--" + flattenLabel(handle)
+}
+
+// forwardFQDNs returns the host names a forward is served under.
+//
+//   - Normal service "app"  -> "app--<handle>.<endpoint>" (one label). Served
+//     off the shared "*.<endpoint>" wildcard cert, so no per-name ACME.
+//   - Explicit wildcard "*.app" (client bound "-R *.app:80:...") ->
+//     "*.app--<handle>.<endpoint>", a genuine child wildcard so the client can
+//     serve arbitrary sub-hosts. Two labels deep, NOT under "*.<endpoint>", so
+//     it gets its OWN DNS-01 wildcard cert — the one case the on_demand_tls ask
+//     gate still backs.
+//
+// A bare "*" service (key valid for ALL services) is an auth wildcard, not a
+// host, and never reaches here as a real forward's serviceName.
+func forwardFQDNs(f *forward, thisEndpoint string) []string {
+	if rest, ok := strings.CutPrefix(f.serviceName, "*."); ok {
+		return []string{"*." + serviceLabel(rest, f.userHandle) + "." + thisEndpoint}
+	}
+	return []string{serviceLabel(f.serviceName, f.userHandle) + "." + thisEndpoint}
+}
+
 func configureNewForward(ctx context.Context, f *forward) error {
 	thisEndpoint := os.Getenv("THIS_ENDPOINT")
 	if thisEndpoint == "" {
 		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
 	}
-
-	fqdns := []string{
-		fmt.Sprintf("*.%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint),
-		fmt.Sprintf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint),
+	caddySockPath := os.Getenv("CADDY_SOCK")
+	if caddySockPath == "" {
+		return fmt.Errorf("CADDY_SOCK must be set")
 	}
-	for _, fqdn := range fqdns {
-		routeID := "route-" + fqdn
-		forwardTo := f.localPath
+	client := getCaddyClient(caddySockPath)
 
-		// Build the Caddy route JSON.
-		routePayload := map[string]any{
-			"@id": routeID,
-			"match": []map[string]any{
-				{"host": []string{fqdn}},
-			},
-			"handle": []map[string]any{
-				{
-					"handler": "subroute",
-					"routes": []map[string]any{
-						{
-							"handle": []map[string]any{
-								{
-									"handler": "reverse_proxy",
-									"upstreams": []map[string]any{
-										{"dial": "unix/" + forwardTo},
-									},
+	// Ensure srv0 + the wildcard DNS-01 policy + catch-all exist before
+	// posting routes (avoids a 404 on the routes array, and guarantees the
+	// on_demand policy the cert gate depends on is present).
+	if err := ensureSrv0Exists(ctx, client); err != nil {
+		return errors.Wrap(err, "failed to ensure srv0 existence")
+	}
+
+	// Reject forwards whose flattened "<service>--<handle>" label would exceed
+	// the DNS 63-char label limit — it'd be an invalid, unroutable hostname.
+	svc := strings.TrimPrefix(f.serviceName, "*.")
+	if label := serviceLabel(svc, f.userHandle); len(label) > 63 {
+		return fmt.Errorf("flattened service label %q is %d chars, over the 63-char DNS label limit (service=%q handle=%q)", label, len(label), f.serviceName, f.userHandle)
+	}
+
+	for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
+		if err := ensureForwardRoute(ctx, client, fqdn, f.localPath); err != nil {
+			return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
+		}
+		// Normal flattened hosts ride the shared "*.<endpoint>" wildcard cert,
+		// so they need no issuance. An explicit "*.service" child wildcard is
+		// two labels deep and NOT covered by it, so mint its own DNS-01 cert.
+		if strings.HasPrefix(fqdn, "*.") {
+			triggerCertIssuance(ctx, client, fqdn)
+		}
+	}
+
+	// Record the forward so the reconcile loop re-pushes its routes if Caddy
+	// is restarted and loses them.
+	regMu.Lock()
+	reg[forwardKey(f)] = f
+	regMu.Unlock()
+
+	// Re-append catch-all AFTER the new forward route so it stays last.
+	if err := ensureCatchAllRoute(ctx, client); err != nil {
+		return errors.Wrap(err, "ensure catch-all route after forward")
+	}
+	return nil
+}
+
+// ensureForwardRoute upserts the reverse-proxy route for a single fqdn at
+// index 0 of srv0 so it matches before the terminal wildcard catch-all.
+func ensureForwardRoute(ctx context.Context, client *http.Client, fqdn, localPath string) error {
+	routeID := "route-" + fqdn
+	routePayload := map[string]any{
+		"@id": routeID,
+		"match": []map[string]any{
+			{"host": []string{fqdn}},
+		},
+		"handle": []map[string]any{
+			{
+				"handler": "subroute",
+				"routes": []map[string]any{
+					{
+						"handle": []map[string]any{
+							{
+								"handler": "reverse_proxy",
+								"upstreams": []map[string]any{
+									{"dial": "unix/" + localPath},
 								},
 							},
 						},
 					},
 				},
 			},
-			"terminal": true,
-		}
-
-		caddySockPath := os.Getenv("CADDY_SOCK")
-		if caddySockPath == "" {
-			return fmt.Errorf("CADDY_SOCK must be set")
-		}
-
-		client := getCaddyClient(caddySockPath)
-
-		// Ensure the server exists to avoid 404 when posting to the routes array
-		if err := ensureSrv0Exists(ctx, client); err != nil {
-			return errors.Wrap(err, "failed to ensure srv0 existence")
-		}
-
-		// 1. Remove the existing route first (if replacing/updating)
-		deleteReq, err := http.NewRequestWithContext(ctx, "DELETE", fmt.Sprintf("http://127.0.0.1/id/%s", routeID), nil)
-		if err != nil {
-			return errors.Wrap(err, "failed to create delete request")
-		}
-		deleteResp, err := client.Do(deleteReq)
-		if err == nil {
-			io.Copy(io.Discard, deleteResp.Body)
-			deleteResp.Body.Close()
-		}
-
-		// 2. Insert the new route at index 0 so it matches before the wildcard
-		// catch-all defined in the Caddyfile (`*.fedproxy.com, https://`),
-		// which is terminal and would otherwise swallow the request.
-		body, err := json.Marshal(routePayload)
-		if err != nil {
-			return errors.Wrap(err, "failed to marshal route payload")
-		}
-
-		reqPath := "http://127.0.0.1/config/apps/http/servers/srv0/routes/0"
-		req, err := http.NewRequestWithContext(ctx, "POST", reqPath, bytes.NewReader(body))
-		if err != nil {
-			return errors.Wrap(err, "failed to create post request")
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode >= 300 {
-			respBody, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("caddy returned non-success status %d: %s", resp.StatusCode, string(respBody))
-		}
-
-		// Kick off background cert issuance immediately so DNS-01 completes
-		// before the first client connects, avoiding a 30-90 s handshake stall.
-		if body, err := json.Marshal([]string{fqdn}); err == nil {
-			if automateReq, err := http.NewRequestWithContext(ctx, "POST",
-				"http://127.0.0.1/config/apps/tls/certificates/automate",
-				bytes.NewReader(body)); err == nil {
-				automateReq.Header.Set("Content-Type", "application/json")
-				if r, err := client.Do(automateReq); err == nil {
-					io.Copy(io.Discard, r.Body)
-					r.Body.Close()
-					log.Printf("🔐 triggered background cert issuance for %s", fqdn)
-				}
-			}
-		}
+		},
+		"terminal": true,
 	}
 
+	// Remove any stale copy first (idempotent: 404 is fine), then insert.
+	delReq, err := http.NewRequestWithContext(ctx, "DELETE", "http://127.0.0.1/id/"+routeID, nil)
+	if err != nil {
+		return errors.Wrap(err, "build delete request")
+	}
+	if delResp, err := client.Do(delReq); err == nil {
+		io.Copy(io.Discard, delResp.Body)
+		delResp.Body.Close()
+	}
+
+	body, err := json.Marshal(routePayload)
+	if err != nil {
+		return errors.Wrap(err, "marshal route payload")
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"http://127.0.0.1/config/apps/http/servers/srv0/routes", bytes.NewReader(body))
+	if err != nil {
+		return errors.Wrap(err, "build route post request")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return errors.Wrap(err, "post route")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("caddy returned non-success status %d: %s", resp.StatusCode, string(respBody))
+	}
 	return nil
+}
+
+// triggerCertIssuance best-effort adds the name to the managed-cert list so
+// DNS-01 issuance starts immediately rather than on the first handshake. Used
+// for the shared "*.<endpoint>" wildcard and for explicit "*.service" child
+// wildcards (which on_demand cannot mint). Best-effort: errors non-fatal.
+func triggerCertIssuance(ctx context.Context, client *http.Client, fqdn string) {
+	body, err := json.Marshal([]string{fqdn})
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"http://127.0.0.1/config/apps/tls/certificates/automate", bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if r, err := client.Do(req); err == nil {
+		io.Copy(io.Discard, r.Body)
+		r.Body.Close()
+		log.Printf("🔐 triggered background cert issuance for %s", fqdn)
+	}
+}
+
+// idExists reports whether Caddy has a config object with the given @id.
+func idExists(ctx context.Context, client *http.Client, id string) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1/id/"+id, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// reconcileLoop keeps Caddy's dynamic config in sync with this relay's view of
+// the world. Caddy can be restarted independently (a deploy does exactly
+// this), which drops the wildcard DNS-01 policy, the catch-all, and every
+// per-forward route — and the relay's live SSH sessions would never re-push
+// them on their own. Every tick it reinstalls the base config and any missing
+// forward routes. Steady-state ticks are GET-only, so this is cheap.
+func reconcileLoop(client *http.Client) {
+	const interval = 30 * time.Second
+	for {
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), interval)
+			defer cancel()
+
+			if err := ensureSrv0Exists(ctx, client); err != nil {
+				log.Printf("⚠️ reconcile base config: %v", err)
+				return
+			}
+
+			thisEndpoint := os.Getenv("THIS_ENDPOINT")
+			regMu.Lock()
+			fwds := make([]*forward, 0, len(reg))
+			for _, f := range reg {
+				fwds = append(fwds, f)
+			}
+			regMu.Unlock()
+
+			for _, f := range fwds {
+				for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
+					if idExists(ctx, client, "route-"+fqdn) {
+						continue
+					}
+					if err := ensureForwardRoute(ctx, client, fqdn, f.localPath); err != nil {
+						log.Printf("⚠️ reconcile route %s: %v", fqdn, err)
+						continue
+					}
+					log.Printf("♻️ reconciled missing route %s", fqdn)
+				}
+			}
+
+			// Re-append catch-all last so it never blocks per-forward routes.
+			if err := ensureCatchAllRoute(ctx, client); err != nil {
+				log.Printf("⚠️ reconcile catch-all route: %v", err)
+			}
+		}()
+		time.Sleep(interval)
+	}
 }
 
 func unconfigureForward(ctx context.Context, f *forward) error {
@@ -655,10 +837,15 @@ func unconfigureForward(ctx context.Context, f *forward) error {
 		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
 	}
 
-	fqdns := []string{
-		fmt.Sprintf("*.%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint),
-		fmt.Sprintf("%s.%s.%s", f.serviceName, f.userHandle, thisEndpoint),
+	// Stop reconciling this forward before tearing its routes down, so the
+	// loop doesn't race to re-add what we're removing.
+	regMu.Lock()
+	if reg[forwardKey(f)] == f {
+		delete(reg, forwardKey(f))
 	}
+	regMu.Unlock()
+
+	fqdns := forwardFQDNs(f, thisEndpoint)
 	for _, fqdn := range fqdns {
 		routeID := "route-" + fqdn
 
