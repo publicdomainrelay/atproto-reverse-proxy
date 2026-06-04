@@ -161,6 +161,7 @@ type AcceptJSON struct {
 			URLRoute  string `json:"url_route"`
 			TokenPath string `json:"token_path"`
 			ActxPath  string `json:"actx_path"`
+			Actx      string `json:"actx"`
 			Subject   string `json:"subject"`
 		} `json:"value"`
 	} `json:"bid_config"`
@@ -210,6 +211,7 @@ type TokenPlugin interface {
 type OIDCPlugin struct {
 	BaseURL         string
 	TeamUUID        string
+	Actx            string
 	IDToken         string
 	Role            string
 	URLRoute        string
@@ -258,7 +260,9 @@ func newOIDCPlugin(accept *AcceptJSON) (*OIDCPlugin, error) {
 	if data, err = os.ReadFile(accept.BidConfig.Value.ActxPath); err != nil {
 		return nil, errors.Wrapf(err, "read team UUID from actx_path=%s", accept.BidConfig.Value.ActxPath)
 	}
-	p.TeamUUID = strings.TrimSpace(string(data))
+	p.TeamUUID = strings.TrimPrefix(strings.TrimSpace(string(data)), "did:plc:")
+
+	p.Actx = accept.BidConfig.Value.Actx
 
 	return p, nil
 }
@@ -269,12 +273,16 @@ func (p *OIDCPlugin) GetToken(ctx context.Context, didPLC string) (string, error
 	if subjectTmpl == "" {
 		subjectTmpl = "actx:{actx}:plc:{did-plc-key}:role:{role}"
 	}
+	actx := p.Actx
+	if actx == "" {
+		actx = p.TeamUUID
+	}
 	subject := strings.NewReplacer(
-		"{actx}", p.TeamUUID,
+		"{actx}", actx,
 		"{did-plc-key}", didPLCKey,
 		"{role}", p.Role,
 	).Replace(subjectTmpl)
-	aud := fmt.Sprintf("api://ATProto?actx=%s", didPLC)
+	aud := fmt.Sprintf("api://ATProto?actx=%s", actx)
 
 	payload, err := json.Marshal(map[string]any{
 		"aud": aud,
