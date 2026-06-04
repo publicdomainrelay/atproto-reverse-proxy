@@ -152,6 +152,9 @@ func newLoggingHTTPClient() *http.Client {
 // ---------------------------------------------------------------------------
 
 type AcceptJSON struct {
+	Accept struct {
+		URI string `json:"uri"`
+	} `json:"accept"`
 	Bid struct {
 		URI string `json:"uri"`
 	} `json:"bid"`
@@ -173,7 +176,7 @@ type AcceptJSON struct {
 }
 
 func (a *AcceptJSON) DID() (string, error) {
-	rest := strings.TrimPrefix(a.Bid.URI, "at://")
+	rest := strings.TrimPrefix(a.Accept.URI, "at://")
 	if rest == a.Bid.URI {
 		return "", fmt.Errorf("bid.uri is not an AT-URI: %s", a.Bid.URI)
 	}
@@ -282,7 +285,7 @@ func (p *OIDCPlugin) GetToken(ctx context.Context, didPLC string) (string, error
 		"{did-plc-key}", didPLCKey,
 		"{role}", p.Role,
 	).Replace(subjectTmpl)
-	aud := fmt.Sprintf("api://ATProto?actx=%s", actx)
+	aud := fmt.Sprintf("api://ATProto?actx=%s", didPLC)
 
 	payload, err := json.Marshal(map[string]any{
 		"aud": aud,
