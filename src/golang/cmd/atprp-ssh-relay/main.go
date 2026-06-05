@@ -182,6 +182,26 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	log.Printf("✅ SSH handshake OK — user=%s", serverConn.User())
 	go func() { serverConn.Wait(); cancel() }()
 
+	// Send SSH-level keepalives so the underlying TCP connection never goes
+	// silent long enough to be idle-closed by network intermediaries (~18s).
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _, err := serverConn.SendRequest("keepalive@openssh.com", true, nil)
+				if err != nil {
+					log.Printf("⚠️ keepalive failed for user=%s: %v", serverConn.User(), err)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
 	// ignore channels
 	go func() {
 		for newChan := range chans {
@@ -373,15 +393,30 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 		defer resp.Body.Close()
 		log.Printf("caddy check srv0 resp.StatusCode=%s", resp.StatusCode)
 		if resp.StatusCode == http.StatusOK {
+			// Patch idle_timeout on the existing srv0 so WebSocket connections
+			// are not idle-closed when silent (Caddy ignores WS ping frames).
+			patchBody, _ := json.Marshal("300s")
+			patchReq, _ := http.NewRequestWithContext(ctx, "PATCH",
+				"http://127.0.0.1/config/apps/http/servers/srv0/idle_timeout",
+				bytes.NewReader(patchBody))
+			patchReq.Header.Set("Content-Type", "application/json")
+			if pr, err := client.Do(patchReq); err == nil {
+				io.Copy(io.Discard, pr.Body)
+				pr.Body.Close()
+			}
 			return ensureWildcardTLSPolicy(ctx, client)
 		}
 	}
 	log.Println("caddy creating srv0...")
 
-	// Initialize the standard server structure if srv0 is missing
+	// Initialize the standard server structure if srv0 is missing.
+	// idle_timeout is set long so WebSocket connections are not dropped when
+	// silent — Caddy's default is short enough to kill idle WS sessions.
+	// Clients must still send data-frame keepalives; this is a safety margin.
 	srvPayload := map[string]any{
-		"listen": []string{":443"},
-		"routes": []any{},
+		"listen":       []string{":443"},
+		"routes":       []any{},
+		"idle_timeout": "300s",
 	}
 
 	body, _ := json.Marshal(srvPayload)
@@ -701,7 +736,8 @@ func ensureForwardRoute(ctx context.Context, client *http.Client, fqdn, localPat
 					{
 						"handle": []map[string]any{
 							{
-								"handler": "reverse_proxy",
+								"handler":        "reverse_proxy",
+								"flush_interval": -1,
 								"upstreams": []map[string]any{
 									{"dial": "unix/" + localPath},
 								},

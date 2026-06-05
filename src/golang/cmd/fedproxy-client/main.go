@@ -541,6 +541,26 @@ func runTunnel(ctx context.Context, signer ssh.Signer, sshHost, sshPort, handle,
 		client.Close()
 	}()
 
+	// Send SSH-level keepalives so the tunnel never goes silent long enough
+	// to be idle-closed by network intermediaries (~18s observed).
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				if err != nil {
+					logError("keepalive failed", map[string]any{"error": err.Error()})
+					ln.Close()
+					return
+				}
+			}
+		}
+	}()
+
 	for {
 		remote, err := ln.Accept()
 		if err != nil {
