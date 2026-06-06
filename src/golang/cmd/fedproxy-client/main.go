@@ -177,12 +177,12 @@ type AcceptJSON struct {
 
 func (a *AcceptJSON) DID() (string, error) {
 	rest := strings.TrimPrefix(a.Accept.URI, "at://")
-	if rest == a.Bid.URI {
-		return "", fmt.Errorf("bid.uri is not an AT-URI: %s", a.Bid.URI)
+	if rest == a.Accept.URI {
+		return "", fmt.Errorf("accept.uri is not an AT-URI: %s", a.Accept.URI)
 	}
 	did := strings.SplitN(rest, "/", 2)[0]
 	if did == "" {
-		return "", fmt.Errorf("could not extract DID from bid.uri: %s", a.Bid.URI)
+		return "", fmt.Errorf("could not extract DID from accept.uri: %s", a.Accept.URI)
 	}
 	return did, nil
 }
