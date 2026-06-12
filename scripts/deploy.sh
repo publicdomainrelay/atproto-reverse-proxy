@@ -11,10 +11,6 @@ mkdir -p target/
 go build -o target ./cmd/...
 cd ../..
 
-cd ./compute-contract-reference-implementation-poc/src/typescript/xrpc-relay/
-deno compile --allow-net --allow-env --allow-read --allow-write -o xrpc-relay-server server.ts
-cd -
-
 cat <<'EOF' > run-via-ssh.sh
 set -xeuo pipefail
 ssh -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" bash -xe
@@ -33,7 +29,6 @@ scp -o StrictHostKeyChecking=accept-new src/golang/Caddyfile "${SSH_TARGET}":/tm
 scp -o StrictHostKeyChecking=accept-new src/golang/target/atprp-ssh-relay "${SSH_TARGET}":/tmp/stage/atprp-ssh-relay
 scp -o StrictHostKeyChecking=accept-new src/golang/target/caddy-check-dns-from-config "${SSH_TARGET}":/tmp/stage/caddy-check-dns-from-config
 scp -o StrictHostKeyChecking=accept-new src/golang/target/oauth-client-webapp "${SSH_TARGET}":/tmp/stage/oauth-client-webapp
-scp -o StrictHostKeyChecking=accept-new compute-contract-reference-implementation-poc/src/typescript/xrpc-relay/xrpc-relay-server "${SSH_TARGET}":/tmp/stage/xrpc-relay-server
 
 
 bash -xe run-via-ssh.sh <<REMOTE_EOF
@@ -47,7 +42,16 @@ sudo mv /tmp/stage/Caddyfile /etc/caddy/Caddyfile
 sudo mv /tmp/stage/atprp-ssh-relay /usr/bin/atprp-ssh-relay
 sudo mv /tmp/stage/caddy-check-dns-from-config /usr/bin/caddy-check-dns-from-config
 sudo mv /tmp/stage/oauth-client-webapp /usr/bin/oauth-client-webapp
-sudo mv /tmp/stage/xrpc-relay-server /usr/bin/xrpc-relay-server
+
+# Install deno if absent (xrpc-relay-server runs from source via deno, no compile).
+if ! command -v deno >/dev/null 2>&1; then
+  command -v unzip >/dev/null 2>&1 || sudo apt-get install -y unzip
+  curl -fsSL https://deno.land/install.sh | sudo DENO_INSTALL=/usr/local sh
+fi
+
+# Clone (or update) latest xrpc-relay source. Run server.ts directly with deno.
+sudo rm -rf /opt/xrpc-relay
+sudo git clone --depth 1 https://github.com/publicdomainrelay/compute-contract-reference-implementation-poc /opt/xrpc-relay
 
 sudo tee /etc/systemd/system/caddy-check-dns-from-config.service <<'EOF'
 [Unit]
@@ -113,11 +117,11 @@ Wants=caddy.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/xrpc-relay-server
+ExecStart=/usr/local/bin/deno run --allow-net --allow-env --allow-read --allow-write --allow-sys /opt/xrpc-relay/src/typescript/xrpc-relay/server.ts
 Environment=UNIX_SOCKET=/opt/caddy/xrpc-relay-server.sock
 Restart=on-failure
 Environment=HOSTNAME=xrpc.fedproxy.com
-WorkingDirectory=/var/run
+WorkingDirectory=/opt/xrpc-relay/src/typescript/xrpc-relay
 RestartSec=5
 
 [Install]
