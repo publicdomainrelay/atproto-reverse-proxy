@@ -1,0 +1,3 @@
+[submodule "compute-contract-reference-implementation-poc"]
+	path = compute-contract-reference-implementation-poc
+	url = https://github.com/publicdomainrelay/compute-contract-reference-implementation-poc

@@ -11,6 +11,10 @@ mkdir -p target/
 go build -o target ./cmd/...
 cd ../..
 
+cd ./compute-contract-reference-implementation-poc/src/typescript/xrpc-relay/
+deno compile --allow-net --allow-env --allow-read --allow-write -o xrpc-relay-server server.ts
+cd -
+
 cat <<'EOF' > run-via-ssh.sh
 set -xeuo pipefail
 ssh -o StrictHostKeyChecking=accept-new "${SSH_TARGET}" bash -xe
@@ -29,6 +33,8 @@ scp -o StrictHostKeyChecking=accept-new src/golang/Caddyfile "${SSH_TARGET}":/tm
 scp -o StrictHostKeyChecking=accept-new src/golang/target/atprp-ssh-relay "${SSH_TARGET}":/tmp/stage/atprp-ssh-relay
 scp -o StrictHostKeyChecking=accept-new src/golang/target/caddy-check-dns-from-config "${SSH_TARGET}":/tmp/stage/caddy-check-dns-from-config
 scp -o StrictHostKeyChecking=accept-new src/golang/target/oauth-client-webapp "${SSH_TARGET}":/tmp/stage/oauth-client-webapp
+scp -o StrictHostKeyChecking=accept-new compute-contract-reference-implementation-poc/src/typescript/xrpc-relay/xrpc-relay-server "${SSH_TARGET}":/tmp/stage/xrpc-relay-server
+
 
 bash -xe run-via-ssh.sh <<REMOTE_EOF
 sudo rm -rf /var/www/html
@@ -41,6 +47,7 @@ sudo mv /tmp/stage/Caddyfile /etc/caddy/Caddyfile
 sudo mv /tmp/stage/atprp-ssh-relay /usr/bin/atprp-ssh-relay
 sudo mv /tmp/stage/caddy-check-dns-from-config /usr/bin/caddy-check-dns-from-config
 sudo mv /tmp/stage/oauth-client-webapp /usr/bin/oauth-client-webapp
+sudo mv /tmp/stage/xrpc-relay-server /usr/bin/xrpc-relay-server
 
 sudo tee /etc/systemd/system/caddy-check-dns-from-config.service <<'EOF'
 [Unit]
@@ -91,6 +98,25 @@ Restart=on-failure
 Environment=CF_API_TOKEN="${CF_API_TOKEN}"
 Environment=THIS_ENDPOINT=fedproxy.com
 Environment=CADDY_SOCK=/opt/caddy/caddy-admin.sock
+WorkingDirectory=/var/run
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo tee /etc/systemd/system/xrpc-relay-server.service <<EOF
+[Unit]
+Description=xrpc-relay-server
+After=network.target caddy.service
+Wants=caddy.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/xrpc-relay-server
+Environment=UNIX_SOCKET=/opt/caddy/xrpc-relay-server.sock
+Restart=on-failure
+Environment=HOSTNAME=xrpc.fedproxy.com
 WorkingDirectory=/var/run
 RestartSec=5
 
@@ -190,6 +216,10 @@ sudo systemctl status --no-pager caddy-check-dns-from-config.service
 sudo systemctl enable --now atprp-ssh-relay.service
 sudo systemctl restart atprp-ssh-relay
 sudo systemctl status --no-pager atprp-ssh-relay.service
+
+sudo systemctl enable --now xrpc-relay-server.service
+sudo systemctl restart xrpc-relay-server
+sudo systemctl status --no-pager xrpc-relay-server.service
 
 sudo systemctl enable --now oauth-client-webapp.service
 sudo systemctl restart oauth-client-webapp

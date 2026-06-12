@@ -74,14 +74,13 @@ https://rp.fedproxy.com {
 #   keepalive_interval  probe the upstream over the unix socket every 30s so
 #                       half-open connections are detected and reaped.
 (xrpc_proxy) {
-	reverse_proxy unix//tmp/xrpc.sock {
+	reverse_proxy unix//opt/caddy/xrpc-relay-server.sock {
 		flush_interval -1
 		stream_close_delay 5m
 		transport http {
 			keepalive_interval 30s
 		}
 	}
-	# reverse_proxy https://xrpc-relay--johnandersen777-bsky-social.fedcicd.com
 }
 
 https://xrpc.fedproxy.com {
