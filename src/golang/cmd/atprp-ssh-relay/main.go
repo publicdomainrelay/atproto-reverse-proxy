@@ -393,30 +393,52 @@ func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
 		defer resp.Body.Close()
 		log.Printf("caddy check srv0 resp.StatusCode=%s", resp.StatusCode)
 		if resp.StatusCode == http.StatusOK {
-			// Patch idle_timeout on the existing srv0 so WebSocket connections
-			// are not idle-closed when silent (Caddy ignores WS ping frames).
-			patchBody, _ := json.Marshal("300s")
-			patchReq, _ := http.NewRequestWithContext(ctx, "PATCH",
-				"http://127.0.0.1/config/apps/http/servers/srv0/idle_timeout",
-				bytes.NewReader(patchBody))
-			patchReq.Header.Set("Content-Type", "application/json")
-			if pr, err := client.Do(patchReq); err == nil {
-				io.Copy(io.Discard, pr.Body)
-				pr.Body.Close()
+			// Disable idle_timeout so WebSocket connections are never
+			// idle-closed by Caddy (Caddy ignores WS ping frames as activity).
+			// "0" means disabled; dead peers are caught at the TCP level.
+			// Only PATCH when it isn't already "0": every write reloads Caddy's
+			// config and cancels in-flight ACME orders, so an unconditional
+			// per-tick PATCH would starve HTTP-01 issuance. Parsing the srv0 we
+			// just fetched keeps the steady-state path GET-only.
+			var srv struct {
+				IdleTimeout json.RawMessage `json:"idle_timeout"`
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = json.Unmarshal(body, &srv)
+			// Caddy serializes a 0 caddy.Duration as omitempty, so a disabled
+			// idle_timeout returns as an absent key (nil RawMessage) or JSON
+			// null — both mean "already disabled". Treat them like "0" and skip
+			// the PATCH; PATCHing an absent key 404s every tick otherwise.
+			idle := string(srv.IdleTimeout)
+			if idle != `"0"` && idle != "0" && idle != "" && idle != "null" {
+				patchBody, _ := json.Marshal("0")
+				patchReq, _ := http.NewRequestWithContext(ctx, "PATCH",
+					"http://127.0.0.1/config/apps/http/servers/srv0/idle_timeout",
+					bytes.NewReader(patchBody))
+				patchReq.Header.Set("Content-Type", "application/json")
+				if pr, err := client.Do(patchReq); err != nil {
+					log.Printf("❌ idle_timeout PATCH failed: %v — WS connections may drop on idle", err)
+				} else {
+					if pr.StatusCode >= 300 {
+						body, _ := io.ReadAll(pr.Body)
+						log.Printf("❌ idle_timeout PATCH non-success %d: %s — WS connections may drop on idle", pr.StatusCode, string(body))
+					}
+					pr.Body.Close()
+				}
 			}
 			return ensureWildcardTLSPolicy(ctx, client)
 		}
 	}
 	log.Println("caddy creating srv0...")
 
-	// Initialize the standard server structure if srv0 is missing.
-	// idle_timeout is set long so WebSocket connections are not dropped when
-	// silent — Caddy's default is short enough to kill idle WS sessions.
-	// Clients must still send data-frame keepalives; this is a safety margin.
+	// idle_timeout "0" disables the HTTP idle timer entirely.
+	// Caddy does not recognize WS ping frames as activity, so any non-zero
+	// timeout would kill silent-but-alive WebSocket sessions. Dead peers are
+	// caught at the TCP level via OS keepalives.
 	srvPayload := map[string]any{
 		"listen":       []string{":443"},
 		"routes":       []any{},
-		"idle_timeout": "300s",
+		"idle_timeout": "0",
 	}
 
 	body, _ := json.Marshal(srvPayload)
@@ -736,10 +758,18 @@ func ensureForwardRoute(ctx context.Context, client *http.Client, fqdn, localPat
 					{
 						"handle": []map[string]any{
 							{
-								"handler":        "reverse_proxy",
-								"flush_interval": -1,
+								"handler":            "reverse_proxy",
+								"flush_interval":     -1,
+								"stream_close_delay": "5m",
 								"upstreams": []map[string]any{
 									{"dial": "unix/" + localPath},
+								},
+								"transport": map[string]any{
+									"protocol": "http",
+									"keep_alive": map[string]any{
+										"enabled":        true,
+										"probe_interval": "30s",
+									},
 								},
 							},
 						},
@@ -845,6 +875,7 @@ func reconcileLoop(client *http.Client) {
 			}
 			regMu.Unlock()
 
+			appended := false
 			for _, f := range fwds {
 				for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
 					if idExists(ctx, client, "route-"+fqdn) {
@@ -854,13 +885,23 @@ func reconcileLoop(client *http.Client) {
 						log.Printf("⚠️ reconcile route %s: %v", fqdn, err)
 						continue
 					}
+					appended = true
 					log.Printf("♻️ reconciled missing route %s", fqdn)
 				}
 			}
 
-			// Re-append catch-all last so it never blocks per-forward routes.
-			if err := ensureCatchAllRoute(ctx, client); err != nil {
-				log.Printf("⚠️ reconcile catch-all route: %v", err)
+			// Re-append catch-all last so it never blocks per-forward routes,
+			// but ONLY when we actually appended a forward route this tick (the
+			// catch-all must sort after every specific route) or the catch-all
+			// is missing entirely. Re-appending unconditionally would rewrite
+			// Caddy's config every tick — each config reload cancels in-flight
+			// ACME orders, so any HTTP-01 cert never gets a full issuance
+			// window. Skipping the write keeps steady-state ticks GET-only.
+			catchAllID := "route-wildcard-catchall-" + thisEndpoint
+			if appended || !idExists(ctx, client, catchAllID) {
+				if err := ensureCatchAllRoute(ctx, client); err != nil {
+					log.Printf("⚠️ reconcile catch-all route: %v", err)
+				}
 			}
 		}()
 		time.Sleep(interval)

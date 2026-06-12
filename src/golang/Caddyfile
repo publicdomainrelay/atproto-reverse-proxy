@@ -24,6 +24,17 @@
 	on_demand_tls {
 		ask http://127.0.0.1:5555/check
 	}
+
+	# Never idle-close connections at the server level. Caddy does not count
+	# WebSocket ping/pong frames as activity, so any non-zero idle timeout
+	# silently kills long-lived-but-quiet WS sessions (xrpc subscriptions).
+	# Dead peers are caught at the TCP level via keepalive probes. This mirrors
+	# the idle_timeout "0" atprp-ssh-relay PATCHes onto srv0 at runtime.
+	servers {
+		timeouts {
+			idle 0
+		}
+	}
 }
 
 # Web UI. Wildcard catch-all + DNS-01 issuance is configured dynamically
@@ -35,7 +46,54 @@ https://fedproxy.com {
 	}
 }
 
+# Serve the shared "*.fedproxy.com" wildcard cert (managed by atprp-ssh-relay's
+# Cloudflare DNS-01 policy) for the static single-label hosts below, instead of
+# letting each site block trigger its OWN per-name ACME issuance. Per-name
+# issuance is fatal here: the relay's reconcile loop and SSH clients push Caddy
+# config updates, and every config reload cancels any in-flight ACME order, so a
+# dedicated xrpc/rp cert never survives long enough to finalize (the wildcard
+# does, because it's obtained once and then just served). xrpc and rp are single
+# labels under fedproxy.com, so the "*.fedproxy.com" cert already covers them.
+# Caddy re-reads file certs on each config load, and reloads are frequent here,
+# so wildcard renewals propagate well within the renewal window.
+(wildcard_cert) {
+	tls /root/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/wildcard_.fedproxy.com/wildcard_.fedproxy.com.crt /root/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/wildcard_.fedproxy.com/wildcard_.fedproxy.com.key
+}
+
 # OAuth Workload Identity Reverse Proxy
 https://rp.fedproxy.com {
+	import wildcard_cert
 	reverse_proxy unix//opt/caddy/web-ui.sock
+}
+
+# WebSocket-friendly reverse_proxy options for the xrpc upstream:
+#   flush_interval -1   stream responses byte-for-byte, no buffering (required
+#                       so server->client WS/SSE frames are not held back).
+#   stream_close_delay  on config reload, let in-flight streams drain up to 5m
+#                       instead of being cut instantly (reloads are frequent).
+#   keepalive_interval  probe the upstream over the unix socket every 30s so
+#                       half-open connections are detected and reaped.
+(xrpc_proxy) {
+	reverse_proxy unix//tmp/xrpc.sock {
+		flush_interval -1
+		stream_close_delay 5m
+		transport http {
+			keepalive_interval 30s
+		}
+	}
+	# reverse_proxy https://xrpc-relay--johnandersen777-bsky-social.fedcicd.com
+}
+
+https://xrpc.fedproxy.com {
+	import wildcard_cert
+	import xrpc_proxy
+}
+
+https://*.xrpc.fedproxy.com {
+	tls {
+		dns cloudflare {
+			api_token {env.CF_API_TOKEN}
+		}
+	}
+	import xrpc_proxy
 }

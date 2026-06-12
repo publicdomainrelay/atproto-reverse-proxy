@@ -153,6 +153,7 @@ Requires=network-online.target
 Type=notify
 User=root
 Group=root
+Environment=CF_API_TOKEN="${CF_API_TOKEN}"
 ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
 ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
 TimeoutStopSec=5s
