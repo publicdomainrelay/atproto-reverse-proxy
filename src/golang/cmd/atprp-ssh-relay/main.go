@@ -657,10 +657,14 @@ func upsertByID(ctx context.Context, client *http.Client, id, arrayURL string, p
 	return nil
 }
 
-// flattenLabel folds an identity part that may contain dots (a handle like
-// "alice.bsky.social", or a dotted service name) into a single DNS label by
-// replacing each dot with a dash.
-func flattenLabel(s string) string { return strings.ReplaceAll(s, ".", "-") }
+// flattenLabel folds an identity part that may contain dots or colons (a handle
+// like "alice.bsky.social", a dotted service name, or a bare DID used as the SSH
+// username like "did:plc:abc123") into a single DNS label by replacing each dot
+// and colon with a dash. Colons appear when the SSH username is a raw DID, which
+// is otherwise an invalid DNS label.
+func flattenLabel(s string) string {
+	return strings.NewReplacer(".", "-", ":", "-").Replace(s)
+}
 
 // serviceLabel builds the flattened single DNS label "<service>--<handle>"
 // (dots -> dashes). Folding the whole identity into one label (instead of
