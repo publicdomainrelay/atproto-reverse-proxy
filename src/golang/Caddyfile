@@ -96,3 +96,28 @@ https://*.xrpc.fedproxy.com {
 	}
 	import xrpc_proxy
 }
+
+# Test env
+(test_xrpc_proxy) {
+	reverse_proxy unix//opt/caddy/xrpc-relay-server-test.sock {
+		flush_interval -1
+		stream_close_delay 5m
+		transport http {
+			keepalive_interval 30s
+		}
+	}
+}
+
+https://xrpc-test.fedproxy.com {
+	import wildcard_cert
+	import test_xrpc_proxy
+}
+
+https://*.xrpc-test.fedproxy.com {
+	tls {
+		dns cloudflare {
+			api_token {env.CF_API_TOKEN}
+		}
+	}
+	import test_xrpc_proxy
+}
