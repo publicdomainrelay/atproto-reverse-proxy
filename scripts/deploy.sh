@@ -8,7 +8,7 @@ echo "${CF_API_TOKEN}"
 cd src/golang
 rm -rf target/
 mkdir -p target/
-go build -o target ./cmd/...
+GOOS=linux GOARCH=amd64 go build -o target ./cmd/...
 cd ../..
 
 cat <<'EOF' > run-via-ssh.sh
@@ -32,6 +32,19 @@ scp -o StrictHostKeyChecking=accept-new src/golang/target/oauth-client-webapp "$
 
 
 bash -xe run-via-ssh.sh <<REMOTE_EOF
+# Create swapfile if absent — 4 GB droplet has no swap by default,
+# which means OOM killer is the only escape valve when memory pressure hits.
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "Created and enabled 2G swapfile"
+else
+  echo "Swapfile already exists, skipping"
+fi
+
 sudo rm -rf /var/www/html
 sudo mkdir -pv /var/www/
 sudo mkdir -pv /opt/caddy
@@ -83,6 +96,7 @@ Restart=on-failure
 Environment=THIS_ENDPOINT=https://rp.fedproxy.com
 Environment=LISTEN_SOCKET=/opt/caddy/web-ui.sock
 Environment=DATABASE_URI=sqlite:////opt/caddy/oauth-client-webapp.db
+Environment=GOMEMLIMIT=512MiB
 WorkingDirectory=/var/run
 RestartSec=5
 
@@ -102,6 +116,7 @@ Restart=on-failure
 Environment=CF_API_TOKEN="${CF_API_TOKEN}"
 Environment=THIS_ENDPOINT=fedproxy.com
 Environment=CADDY_SOCK=/opt/caddy/caddy-admin.sock
+Environment=GOMEMLIMIT=3GiB
 WorkingDirectory=/var/run
 RestartSec=5
 

@@ -26,7 +26,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/golang-jwt/jwt/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/pkg/errors"
 )
 
@@ -93,9 +93,9 @@ func NewOAuthStore(ctx context.Context) (AppStore, error) {
 		// SQLAlchemy convention: sqlite:///relative, sqlite:////absolute
 		path := strings.TrimPrefix(dbURI, u.Scheme+"://")
 		path = strings.TrimPrefix(path, "/")
-		return newDBStore(ctx, "sqlite3", path)
+		return newDBStore(ctx, "sqlite", path)
 	default:
-		return newDBStore(ctx, "sqlite3", dbURI)
+		return newDBStore(ctx, "sqlite", dbURI)
 	}
 }
 

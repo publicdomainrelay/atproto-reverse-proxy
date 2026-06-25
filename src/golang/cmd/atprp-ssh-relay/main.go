@@ -54,10 +54,30 @@ var (
 	reg   = map[string]*forward{}
 )
 
+// sshPublicKeyCacheEntry holds a cached getSSHPublicKeys result with expiry.
+type sshPublicKeyCacheEntry struct {
+	keys      []*SSHPublicKey
+	expiresAt time.Time
+}
+
+var (
+	sshPublicKeyCacheMu sync.RWMutex
+	sshPublicKeyCache   = make(map[string]*sshPublicKeyCacheEntry)
+)
+
+const (
+	sshPublicKeyCacheTTL    = 5 * time.Minute
+	maxConcurrentHandshakes = 50
+)
+
 func forwardKey(f *forward) string { return f.serviceName + "\x00" + f.userHandle }
 
 func main() {
 	log.Println("▶️ Starting SSH-forward server")
+
+	if os.Getenv("GOMEMLIMIT") == "" {
+		log.Println("⚠️ GOMEMLIMIT not set — Go heap may grow until kernel OOM. Set GOMEMLIMIT=3GiB or similar.")
+	}
 
 	signer, err := loadOrGenerateHostKey("host_key")
 	if err != nil {
@@ -66,7 +86,8 @@ func main() {
 
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
 			// Check if we have a valid ATProto handle as SSH username
 			log.Printf("Resolving DID PLC and PDS for user=%s", c.User())
@@ -81,7 +102,7 @@ func main() {
 			log.Printf("Got DID PLC and PDS for user=%s did=%s pds=%s", c.User(), ident.DID, pds)
 
 			log.Printf("Resolving public keys for user=%s", c.User())
-			sshPublicKeys, err := getSSHPublicKeys(ctx, pds, ident.DID.String())
+			sshPublicKeys, err := cachedGetSSHPublicKeys(ctx, pds, ident.DID.String())
 			if err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("Failed get ssh public keys for user=%s: %v", c.User(), err))
 			}
@@ -133,13 +154,18 @@ func main() {
 		log.Println("⚠️ CADDY_SOCK unset — Caddy reconciliation disabled")
 	}
 
+	handshakeSem := make(chan struct{}, maxConcurrentHandshakes)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Printf("⚠️ accept error: %v", err)
 			continue
 		}
-		go handleSSH(conn, cfg)
+		handshakeSem <- struct{}{}
+		go func() {
+			defer func() { <-handshakeSem }()
+			handleSSH(conn, cfg)
+		}()
 	}
 }
 
@@ -354,11 +380,21 @@ func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TC
 	}
 	go ssh.DiscardRequests(reqs)
 
+	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(channel, conn)
 		channel.CloseWrite()
+		done <- struct{}{}
 	}()
-	io.Copy(conn, channel)
+	go func() {
+		io.Copy(conn, channel)
+		done <- struct{}{}
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 	channel.Close()
 	log.Printf("✅ closed TCP proxy for %s:%d", f.BindAddr, f.BindPort)
 }
@@ -733,16 +769,18 @@ func configureNewForward(ctx context.Context, f *forward) error {
 		}
 	}
 
-	// Record the forward so the reconcile loop re-pushes its routes if Caddy
-	// is restarted and loses them.
-	regMu.Lock()
-	reg[forwardKey(f)] = f
-	regMu.Unlock()
-
 	// Re-append catch-all AFTER the new forward route so it stays last.
 	if err := ensureCatchAllRoute(ctx, client); err != nil {
 		return errors.Wrap(err, "ensure catch-all route after forward")
 	}
+
+	// Record the forward so the reconcile loop re-pushes its routes if Caddy
+	// is restarted and loses them. Must happen AFTER all fallible operations
+	// so a partial failure does not leak a stale entry in the global map.
+	regMu.Lock()
+	reg[forwardKey(f)] = f
+	regMu.Unlock()
+
 	return nil
 }
 
@@ -1002,6 +1040,34 @@ func resolveATProtoIdentifier(ctx context.Context, inputId string) (*identity.Id
 	}
 
 	return ident, nil
+}
+
+// cachedGetSSHPublicKeys wraps getSSHPublicKeys with an in-memory TTL cache
+// keyed by DID. Under an SSH auth storm the same DIDs are looked up repeatedly;
+// caching avoids paginating the user's entire SSH key collection from the PDS
+// on every single attempt.
+func cachedGetSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
+	sshPublicKeyCacheMu.RLock()
+	if entry, ok := sshPublicKeyCache[did]; ok && time.Now().Before(entry.expiresAt) {
+		keys := entry.keys
+		sshPublicKeyCacheMu.RUnlock()
+		return keys, nil
+	}
+	sshPublicKeyCacheMu.RUnlock()
+
+	keys, err := getSSHPublicKeys(ctx, pdsUrl, did)
+	if err != nil {
+		return nil, err
+	}
+
+	sshPublicKeyCacheMu.Lock()
+	sshPublicKeyCache[did] = &sshPublicKeyCacheEntry{
+		keys:      keys,
+		expiresAt: time.Now().Add(sshPublicKeyCacheTTL),
+	}
+	sshPublicKeyCacheMu.Unlock()
+
+	return keys, nil
 }
 
 func getSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
