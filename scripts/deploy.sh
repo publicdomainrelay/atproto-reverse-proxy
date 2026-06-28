@@ -212,6 +212,21 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 EOF
 
+# Caddy runs at debug log level to aid fault isolation, but the indigo-relay
+# WebSocket fan-out generates ~100 MB of TLS-handshake logs per minute at peak.
+# Without a size cap /var/log fills the root volume (77 GB), which blocks
+# atprp-ssh-relay from creating /tmp/ssh-fwd-* (ENOSPC) → "no route configured
+# for host" for every SSH login even though the AT Protocol record is valid.
+# logrotate ships with a weekly × 4 rotation for syslog but no maxsize and
+# a missing "su" directive on this host (group-writable /var/log), so the
+# default config silently skips rotation entirely.
+if ! grep -q 'maxsize 500M' /etc/logrotate.d/rsyslog 2>/dev/null; then
+  sudo sed -i '/rotate 4$/a\\tmaxsize 500M' /etc/logrotate.d/rsyslog
+fi
+if ! grep -q 'su root syslog' /etc/logrotate.d/rsyslog 2>/dev/null; then
+  sudo sed -i '/rotate 4$/a\\tsu root syslog' /etc/logrotate.d/rsyslog
+fi
+
 sudo systemctl daemon-reload
 
 # ORDER MATTERS. Caddy must come up FIRST and be the stable target. The relay
