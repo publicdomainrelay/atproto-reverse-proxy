@@ -227,6 +227,15 @@ if ! grep -q 'su root syslog' /etc/logrotate.d/rsyslog 2>/dev/null; then
   sudo sed -i '/rotate 4$/a\\tsu root syslog' /etc/logrotate.d/rsyslog
 fi
 
+# Caddy logs to journald (systemd), not syslog. Without a size cap the journal
+# grows unbounded — debug-level JSON from WebSocket handshakes alone produces
+# ~200 MB/hour. 500M cap keeps ~2.5h of debug logs which is enough for fault
+# isolation without filling the root volume.
+if ! grep -q '^SystemMaxUse=' /etc/systemd/journald.conf 2>/dev/null; then
+  echo 'SystemMaxUse=500M' | sudo tee -a /etc/systemd/journald.conf >/dev/null
+  sudo systemctl restart systemd-journald
+fi
+
 sudo systemctl daemon-reload
 
 # ORDER MATTERS. Caddy must come up FIRST and be the stable target. The relay

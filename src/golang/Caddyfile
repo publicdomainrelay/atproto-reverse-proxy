@@ -12,7 +12,7 @@
 	# admin unix/{env.PWD}/caddy-admin.sock
 	admin unix//opt/caddy/caddy-admin.sock
 	log default {
-		level debug
+		level info
 	}
 
 	# On-demand TLS gating: caddy-check-dns-from-config inspects the live
