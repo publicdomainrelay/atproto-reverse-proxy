@@ -422,55 +422,85 @@ func getCaddyClient(caddySockPath string) *http.Client {
 // Note: the wildcard catch-all route is NOT installed here. Callers must call
 // ensureCatchAllRoute after all per-forward routes have been appended so that
 // the catch-all always sorts last.
+// patchSrv0IdleTimeout disables idle_timeout on an already-existing srv0 so
+// WebSocket connections are never idle-closed by Caddy (Caddy ignores WS ping
+// frames as activity). "0" means disabled; dead peers are caught at the TCP
+// level via OS keepalives. Only PATCH when it isn't already "0": every write
+// reloads Caddy's config and cancels in-flight ACME orders, so an unconditional
+// per-tick PATCH would starve HTTP-01 issuance.
+func patchSrv0IdleTimeout(ctx context.Context, client *http.Client, respBody []byte) {
+	var srv struct {
+		IdleTimeout json.RawMessage `json:"idle_timeout"`
+	}
+	_ = json.Unmarshal(respBody, &srv)
+	// Caddy serializes a 0 caddy.Duration as omitempty, so a disabled
+	// idle_timeout returns as an absent key (nil RawMessage) or JSON
+	// null — both mean "already disabled".
+	idle := string(srv.IdleTimeout)
+	if idle == `"0"` || idle == "0" || idle == "" || idle == "null" {
+		return
+	}
+	patchBody, _ := json.Marshal("0")
+	patchReq, _ := http.NewRequestWithContext(ctx, "PATCH",
+		"http://127.0.0.1/config/apps/http/servers/srv0/idle_timeout",
+		bytes.NewReader(patchBody))
+	patchReq.Header.Set("Content-Type", "application/json")
+	pr, err := client.Do(patchReq)
+	if err != nil {
+		log.Printf("❌ idle_timeout PATCH failed: %v — WS connections may drop on idle", err)
+		return
+	}
+	if pr.StatusCode >= 300 {
+		body, _ := io.ReadAll(pr.Body)
+		log.Printf("❌ idle_timeout PATCH non-success %d: %s — WS connections may drop on idle", pr.StatusCode, string(body))
+	}
+	pr.Body.Close()
+}
+
 func ensureSrv0Exists(ctx context.Context, client *http.Client) error {
+	// Try GET first. If srv0 exists, Caddy already loaded the Caddyfile and
+	// populated the static routes (xrpc, rp, etc.). Patch idle_timeout and
+	// return — never touch the routes array.
 	checkReq, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1/config/apps/http/servers/srv0", nil)
 	resp, err := client.Do(checkReq)
 	if err == nil {
-		defer resp.Body.Close()
-		log.Printf("caddy check srv0 resp.StatusCode=%s", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
-			// Disable idle_timeout so WebSocket connections are never
-			// idle-closed by Caddy (Caddy ignores WS ping frames as activity).
-			// "0" means disabled; dead peers are caught at the TCP level.
-			// Only PATCH when it isn't already "0": every write reloads Caddy's
-			// config and cancels in-flight ACME orders, so an unconditional
-			// per-tick PATCH would starve HTTP-01 issuance. Parsing the srv0 we
-			// just fetched keeps the steady-state path GET-only.
-			var srv struct {
-				IdleTimeout json.RawMessage `json:"idle_timeout"`
-			}
-			body, _ := io.ReadAll(resp.Body)
-			_ = json.Unmarshal(body, &srv)
-			// Caddy serializes a 0 caddy.Duration as omitempty, so a disabled
-			// idle_timeout returns as an absent key (nil RawMessage) or JSON
-			// null — both mean "already disabled". Treat them like "0" and skip
-			// the PATCH; PATCHing an absent key 404s every tick otherwise.
-			idle := string(srv.IdleTimeout)
-			if idle != `"0"` && idle != "0" && idle != "" && idle != "null" {
-				patchBody, _ := json.Marshal("0")
-				patchReq, _ := http.NewRequestWithContext(ctx, "PATCH",
-					"http://127.0.0.1/config/apps/http/servers/srv0/idle_timeout",
-					bytes.NewReader(patchBody))
-				patchReq.Header.Set("Content-Type", "application/json")
-				if pr, err := client.Do(patchReq); err != nil {
-					log.Printf("❌ idle_timeout PATCH failed: %v — WS connections may drop on idle", err)
-				} else {
-					if pr.StatusCode >= 300 {
-						body, _ := io.ReadAll(pr.Body)
-						log.Printf("❌ idle_timeout PATCH non-success %d: %s — WS connections may drop on idle", pr.StatusCode, string(body))
-					}
-					pr.Body.Close()
-				}
-			}
+			patchSrv0IdleTimeout(ctx, client, body)
 			return ensureWildcardTLSPolicy(ctx, client)
 		}
 	}
-	log.Println("caddy creating srv0...")
+
+	// srv0 does not exist yet. Wait for Caddy to load the Caddyfile (which
+	// creates srv0 with the static routes from the Caddyfile). If the relay
+	// creates srv0 first via the admin API with an empty routes array, Caddy
+	// will never apply the Caddyfile's static site blocks — they all route
+	// through the API-created srv0. Retry for up to 10 s; only fall back to
+	// creating an empty srv0 if Caddy never materializes one.
+	const retryInterval = 500 * time.Millisecond
+	const maxRetries = 20 // 10 s total
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		time.Sleep(retryInterval)
+		checkReq, _ := http.NewRequestWithContext(ctx, "GET", "http://127.0.0.1/config/apps/http/servers/srv0", nil)
+		resp, err := client.Do(checkReq)
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				log.Printf("caddy srv0 appeared after %dms (Caddyfile loaded)", (attempt+1)*500)
+				patchSrv0IdleTimeout(ctx, client, body)
+				return ensureWildcardTLSPolicy(ctx, client)
+			}
+		}
+	}
+
+	// Timed out waiting for Caddy — create srv0 as fallback. Static Caddyfile
+	// routes (xrpc.fedproxy.com, rp.fedproxy.com, etc.) will NOT be present;
+	// they must be re-added dynamically or via a subsequent Caddy reload.
+	log.Println("caddy creating srv0 (Caddyfile did not load in time — static routes will be missing)")
 
 	// idle_timeout "0" disables the HTTP idle timer entirely.
-	// Caddy does not recognize WS ping frames as activity, so any non-zero
-	// timeout would kill silent-but-alive WebSocket sessions. Dead peers are
-	// caught at the TCP level via OS keepalives.
 	srvPayload := map[string]any{
 		"listen":       []string{":443"},
 		"routes":       []any{},
