@@ -116,7 +116,7 @@ Restart=on-failure
 Environment=CF_API_TOKEN="${CF_API_TOKEN}"
 Environment=THIS_ENDPOINT=fedproxy.com
 Environment=CADDY_SOCK=/opt/caddy/caddy-admin.sock
-Environment=GOMEMLIMIT=3GiB
+Environment=GOMEMLIMIT=2GiB
 WorkingDirectory=/var/run
 RestartSec=5
 

@@ -21,10 +21,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -55,8 +58,12 @@ var (
 )
 
 // sshPublicKeyCacheEntry holds a cached getSSHPublicKeys result with expiry.
+// A nil keys slice with a non-empty err means the last lookup failed —
+// negative caching prevents auth storms from hammering the PDS on every
+// reconnect attempt for the same failing DID.
 type sshPublicKeyCacheEntry struct {
 	keys      []*SSHPublicKey
+	err       error
 	expiresAt time.Time
 }
 
@@ -65,9 +72,15 @@ var (
 	sshPublicKeyCache   = make(map[string]*sshPublicKeyCacheEntry)
 )
 
+var (
+	activeConns   int64
+	maxConnsLimit int64 = 200
+)
+
 const (
-	sshPublicKeyCacheTTL    = 5 * time.Minute
-	maxConcurrentHandshakes = 50
+	sshPublicKeyCacheTTL       = 5 * time.Minute
+	sshPublicKeyNegCacheTTL    = 30 * time.Second
+	maxConcurrentHandshakes    = 50
 )
 
 func forwardKey(f *forward) string { return f.serviceName + "\x00" + f.userHandle }
@@ -142,6 +155,17 @@ func main() {
 	}
 	log.Println("✅ SSH listening on :2222")
 
+	// pprof server on loopback for live heap/goroutine profiling.
+	go func() {
+		pprofLn, err := net.Listen("tcp", "127.0.0.1:6060")
+		if err != nil {
+			log.Printf("⚠️ pprof listen failed: %v", err)
+			return
+		}
+		log.Printf("🔬 pprof listening on %s", pprofLn.Addr())
+		http.Serve(pprofLn, nil)
+	}()
+
 	// Install the wildcard DNS-01 on_demand policy + catch-all immediately and
 	// keep them (plus every active forward's route) alive. Without this the
 	// DNS-01 policy only existed after the first forward connected, and any
@@ -154,6 +178,41 @@ func main() {
 		log.Println("⚠️ CADDY_SOCK unset — Caddy reconciliation disabled")
 	}
 
+	// Periodically force Go to return unused heap to the OS. Go's runtime never
+	// releases memory to the kernel under normal GC — it holds onto it for future
+	// allocations. That means VmRSS stays near GOMEMLIMIT forever even when live
+	// heap is small. FreeOSMemory triggers a GC + scavenge pass that unmaps idle
+	// pages back to the kernel.
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			debug.FreeOSMemory()
+			log.Println("🧹 returned unused heap to OS")
+		}
+	}()
+
+	// Prune expired sshPublicKeyCache entries so cached key blobs don't accumulate
+	// in the heap forever. The cache guards lookups with a TTL check but the map
+	// itself never drops stale entries — each entry holds the full []*SSHPublicKey
+	// slice for a DID, which includes the raw ATProto record Value blobs.
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			now := time.Now()
+			sshPublicKeyCacheMu.Lock()
+			for k, v := range sshPublicKeyCache {
+				if now.After(v.expiresAt) {
+					delete(sshPublicKeyCache, k)
+				}
+			}
+			n := len(sshPublicKeyCache)
+			sshPublicKeyCacheMu.Unlock()
+			if n > 0 {
+				log.Printf("🧹 sshPublicKeyCache pruned, %d entries remaining", n)
+			}
+		}
+	}()
+
 	handshakeSem := make(chan struct{}, maxConcurrentHandshakes)
 	for {
 		conn, err := ln.Accept()
@@ -161,9 +220,21 @@ func main() {
 			log.Printf("⚠️ accept error: %v", err)
 			continue
 		}
+
+		n := atomic.AddInt64(&activeConns, 1)
+		if n > maxConnsLimit {
+			atomic.AddInt64(&activeConns, -1)
+			conn.Close()
+			if n%50 == 1 {
+				log.Printf("🚫 dropping connection — at limit (%d/%d)", n, maxConnsLimit)
+			}
+			continue
+		}
+
 		handshakeSem <- struct{}{}
 		go func() {
 			defer func() { <-handshakeSem }()
+			defer atomic.AddInt64(&activeConns, -1)
 			handleSSH(conn, cfg)
 		}()
 	}
@@ -1075,29 +1146,32 @@ func resolveATProtoIdentifier(ctx context.Context, inputId string) (*identity.Id
 // cachedGetSSHPublicKeys wraps getSSHPublicKeys with an in-memory TTL cache
 // keyed by DID. Under an SSH auth storm the same DIDs are looked up repeatedly;
 // caching avoids paginating the user's entire SSH key collection from the PDS
-// on every single attempt.
+// on every single attempt. Errors are also cached (negative caching) with a
+// shorter TTL so a failing PDS doesn't get hammered on every reconnect.
 func cachedGetSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
 	sshPublicKeyCacheMu.RLock()
 	if entry, ok := sshPublicKeyCache[did]; ok && time.Now().Before(entry.expiresAt) {
-		keys := entry.keys
+		keys, err := entry.keys, entry.err
 		sshPublicKeyCacheMu.RUnlock()
-		return keys, nil
+		return keys, err
 	}
 	sshPublicKeyCacheMu.RUnlock()
 
 	keys, err := getSSHPublicKeys(ctx, pdsUrl, did)
-	if err != nil {
-		return nil, err
-	}
 
 	sshPublicKeyCacheMu.Lock()
+	ttl := sshPublicKeyCacheTTL
+	if err != nil {
+		ttl = sshPublicKeyNegCacheTTL
+	}
 	sshPublicKeyCache[did] = &sshPublicKeyCacheEntry{
 		keys:      keys,
-		expiresAt: time.Now().Add(sshPublicKeyCacheTTL),
+		err:       err,
+		expiresAt: time.Now().Add(ttl),
 	}
 	sshPublicKeyCacheMu.Unlock()
 
-	return keys, nil
+	return keys, err
 }
 
 func getSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
@@ -1120,7 +1194,6 @@ func getSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey,
 			if rec == nil {
 				continue
 			}
-			fmt.Printf("uri=%s cid=%s value=%s\n", rec.Uri, rec.Cid, rec.Value)
 
 			var sshPublicKey SSHPublicKey
 
