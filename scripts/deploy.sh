@@ -62,9 +62,13 @@ if ! command -v deno >/dev/null 2>&1; then
   curl -fsSL https://deno.land/install.sh | sudo DENO_INSTALL=/usr/local sh
 fi
 
-# Clone (or update) latest xrpc-relay source. Run server.ts directly with deno.
+# Clone (or update) did-key-ingress-proxy relay source (pre-iroh branch with did:plc support).
+# Run the hono factory CLI directly with deno.
 sudo rm -rf /opt/xrpc-relay
-sudo git clone --depth 1 https://github.com/publicdomainrelay/compute-contract-reference-implementation-poc /opt/xrpc-relay
+sudo git clone --depth 1 --branch pre-iroh https://github.com/publicdomainrelay/org-root-dispatcher-typescript /opt/xrpc-relay
+cd /opt/xrpc-relay
+sudo git submodule update --init --depth 1 did-key-ingress-proxy typescript-helpers
+cd -
 
 sudo tee /etc/systemd/system/caddy-check-dns-from-config.service <<'EOF'
 [Unit]
@@ -132,11 +136,11 @@ Wants=caddy.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/deno run --allow-net --allow-env --allow-read --allow-write --allow-sys /opt/xrpc-relay/src/typescript/xrpc-relay/server.ts
+ExecStart=/usr/local/bin/deno run --allow-net --allow-env --allow-read --allow-write --allow-sys /opt/xrpc-relay/did-key-ingress-proxy/hono-did-key-ingress-proxy/mod.ts
 Environment=UNIX_SOCKET=/opt/caddy/xrpc-relay-server.sock
 Restart=on-failure
 Environment=HOSTNAME=xrpc.fedproxy.com
-WorkingDirectory=/opt/xrpc-relay/src/typescript/xrpc-relay
+WorkingDirectory=/opt/xrpc-relay/did-key-ingress-proxy
 RestartSec=5
 
 [Install]
