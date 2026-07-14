@@ -48,15 +48,6 @@ type forward struct {
 	userHandle  string
 }
 
-// reg tracks every forward currently established so the reconcile loop can
-// re-push its Caddy routes if Caddy is restarted out from under us (e.g. by a
-// deploy), which wipes all dynamically-pushed config. Keyed by
-// serviceName + "\x00" + userHandle (the same identity a route @id derives from).
-var (
-	regMu sync.Mutex
-	reg   = map[string]*forward{}
-)
-
 // sshPublicKeyCacheEntry holds a cached getSSHPublicKeys result with expiry.
 // A nil keys slice with a non-empty err means the last lookup failed —
 // negative caching prevents auth storms from hammering the PDS on every
@@ -67,15 +58,30 @@ type sshPublicKeyCacheEntry struct {
 	expiresAt time.Time
 }
 
-var (
-	sshPublicKeyCacheMu sync.RWMutex
-	sshPublicKeyCache   = make(map[string]*sshPublicKeyCacheEntry)
-)
+// server holds shared state initialized once in main() and threaded through
+// the call graph explicitly — no package-level sync.Once singletons.
+type server struct {
+	// ATProto identity directory. identity.DefaultDirectory() creates
+	// expirable LRU caches each backed by a background goroutine.
+	// Creating one per auth attempt leaks goroutines (observed: 238k).
+	directory identity.Directory
 
-var (
+	// HTTP client for the Caddy admin Unix socket. Reused by all
+	// forward configure/unconfigure/reconcile calls.
+	caddyClient *http.Client
+
+	// SSH public key cache guards against repeated PDS lookups for the
+	// same DID during auth storms.
+	sshPublicKeyCacheMu sync.RWMutex
+	sshPublicKeyCache   map[string]*sshPublicKeyCacheEntry
+
+	// Forward registry for the reconcile loop.
+	regMu sync.Mutex
+	reg   map[string]*forward
+
 	activeConns   int64
-	maxConnsLimit int64 = 200
-)
+	maxConnsLimit int64
+}
 
 const (
 	sshPublicKeyCacheTTL       = 5 * time.Minute
@@ -92,19 +98,48 @@ func main() {
 		log.Println("⚠️ GOMEMLIMIT not set — Go heap may grow until kernel OOM. Set GOMEMLIMIT=3GiB or similar.")
 	}
 
+	srv := &server{
+		directory:        identity.DefaultDirectory(),
+		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
+		reg:              make(map[string]*forward),
+		maxConnsLimit:    200,
+	}
+	if s := os.Getenv("CADDY_SOCK"); s != "" {
+		srv.caddyClient = &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+					return net.Dial("unix", s)
+				},
+			},
+		}
+	}
+
 	signer, err := loadOrGenerateHostKey("host_key")
 	if err != nil {
 		log.Fatalf("❌ host key load/generate failed: %v", err)
 	}
 
+	// TEST_ACCEPT_ANY_KEY bypasses ATProto identity + PDS key resolution
+	// and accepts any SSH key for any user, with a wildcard service ("*").
+	// Only for integration testing — never set in production.
+	testAcceptAnyKey := os.Getenv("TEST_ACCEPT_ANY_KEY") == "1"
+
 	cfg := &ssh.ServerConfig{
 		PublicKeyCallback: func(c ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+			if testAcceptAnyKey {
+				return &ssh.Permissions{
+					Extensions: map[string]string{
+						"pubkey-fp":                 ssh.FingerprintSHA256(pubKey),
+						"pubkey-valid-for-services": "*",
+					},
+				}, nil
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			// Check if we have a valid ATProto handle as SSH username
 			log.Printf("Resolving DID PLC and PDS for user=%s", c.User())
-			ident, err := resolveATProtoIdentifier(ctx, c.User())
+			ident, err := srv.resolveATProtoIdentifier(ctx, c.User())
 			if err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("Failed to resolve DID PLC and PDS for user=%s: %v", c.User()))
 			}
@@ -115,7 +150,7 @@ func main() {
 			log.Printf("Got DID PLC and PDS for user=%s did=%s pds=%s", c.User(), ident.DID, pds)
 
 			log.Printf("Resolving public keys for user=%s", c.User())
-			sshPublicKeys, err := cachedGetSSHPublicKeys(ctx, pds, ident.DID.String())
+			sshPublicKeys, err := srv.cachedGetSSHPublicKeys(ctx, pds, ident.DID.String())
 			if err != nil {
 				return nil, errors.Wrap(err, fmt.Sprintf("Failed get ssh public keys for user=%s: %v", c.User(), err))
 			}
@@ -137,7 +172,6 @@ func main() {
 			}
 			if len(services) > 0 {
 				return &ssh.Permissions{
-					// Record the public key used for authentication.
 					Extensions: map[string]string{
 						"pubkey-fp":                 ssh.FingerprintSHA256(pubKey),
 						"pubkey-valid-for-services": strings.Join(services, ","),
@@ -149,40 +183,41 @@ func main() {
 	}
 	cfg.AddHostKey(signer)
 
-	ln, err := net.Listen("tcp", ":2222")
-	if err != nil {
-		log.Fatalf("❌ listen tcp: %v", err)
+	sshAddr := os.Getenv("SSH_LISTEN_ADDR")
+	if sshAddr == "" {
+		sshAddr = ":2222"
 	}
-	log.Println("✅ SSH listening on :2222")
+	ln, err := net.Listen("tcp", sshAddr)
+	if err != nil {
+		log.Fatalf("❌ listen tcp %s: %v", sshAddr, err)
+	}
+	log.Printf("✅ SSH listening on %s", ln.Addr())
 
 	// pprof server on loopback for live heap/goroutine profiling.
 	go func() {
-		pprofLn, err := net.Listen("tcp", "127.0.0.1:6060")
+		pprofAddr := os.Getenv("PPROF_LISTEN_ADDR")
+		if pprofAddr == "" {
+			pprofAddr = "127.0.0.1:6060"
+		}
+		pprofLn, err := net.Listen("tcp", pprofAddr)
 		if err != nil {
-			log.Printf("⚠️ pprof listen failed: %v", err)
+			log.Printf("⚠️ pprof listen %s failed: %v", pprofAddr, err)
 			return
 		}
 		log.Printf("🔬 pprof listening on %s", pprofLn.Addr())
 		http.Serve(pprofLn, nil)
 	}()
 
-	// Install the wildcard DNS-01 on_demand policy + catch-all immediately and
-	// keep them (plus every active forward's route) alive. Without this the
-	// DNS-01 policy only existed after the first forward connected, and any
-	// Caddy restart silently dropped all dynamic config until clients happened
-	// to reconnect — leaving on-demand cert issuance dead in the meantime.
-	if caddySock := os.Getenv("CADDY_SOCK"); caddySock != "" {
-		go reconcileLoop(getCaddyClient(caddySock))
+	// Reconcile loop keeps Caddy's dynamic config in sync. If CADDY_SOCK
+	// is unset the loop is a no-op (srv.caddyClient is nil).
+	if srv.caddyClient != nil {
+		go srv.reconcileLoop()
 		log.Println("♻️ started Caddy reconcile loop")
 	} else {
 		log.Println("⚠️ CADDY_SOCK unset — Caddy reconciliation disabled")
 	}
 
-	// Periodically force Go to return unused heap to the OS. Go's runtime never
-	// releases memory to the kernel under normal GC — it holds onto it for future
-	// allocations. That means VmRSS stays near GOMEMLIMIT forever even when live
-	// heap is small. FreeOSMemory triggers a GC + scavenge pass that unmaps idle
-	// pages back to the kernel.
+	// Periodically force Go to return unused heap to the OS.
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
@@ -191,27 +226,8 @@ func main() {
 		}
 	}()
 
-	// Prune expired sshPublicKeyCache entries so cached key blobs don't accumulate
-	// in the heap forever. The cache guards lookups with a TTL check but the map
-	// itself never drops stale entries — each entry holds the full []*SSHPublicKey
-	// slice for a DID, which includes the raw ATProto record Value blobs.
-	go func() {
-		for {
-			time.Sleep(5 * time.Minute)
-			now := time.Now()
-			sshPublicKeyCacheMu.Lock()
-			for k, v := range sshPublicKeyCache {
-				if now.After(v.expiresAt) {
-					delete(sshPublicKeyCache, k)
-				}
-			}
-			n := len(sshPublicKeyCache)
-			sshPublicKeyCacheMu.Unlock()
-			if n > 0 {
-				log.Printf("🧹 sshPublicKeyCache pruned, %d entries remaining", n)
-			}
-		}
-	}()
+	// Prune expired sshPublicKeyCache entries.
+	go srv.pruneSSHPublicKeyCacheLoop()
 
 	handshakeSem := make(chan struct{}, maxConcurrentHandshakes)
 	for {
@@ -221,12 +237,12 @@ func main() {
 			continue
 		}
 
-		n := atomic.AddInt64(&activeConns, 1)
-		if n > maxConnsLimit {
-			atomic.AddInt64(&activeConns, -1)
+		n := atomic.AddInt64(&srv.activeConns, 1)
+		if n > srv.maxConnsLimit {
+			atomic.AddInt64(&srv.activeConns, -1)
 			conn.Close()
 			if n%50 == 1 {
-				log.Printf("🚫 dropping connection — at limit (%d/%d)", n, maxConnsLimit)
+				log.Printf("🚫 dropping connection — at limit (%d/%d)", n, srv.maxConnsLimit)
 			}
 			continue
 		}
@@ -234,8 +250,8 @@ func main() {
 		handshakeSem <- struct{}{}
 		go func() {
 			defer func() { <-handshakeSem }()
-			defer atomic.AddInt64(&activeConns, -1)
-			handleSSH(conn, cfg)
+			defer atomic.AddInt64(&srv.activeConns, -1)
+			srv.handleSSH(conn, cfg)
 		}()
 	}
 }
@@ -265,7 +281,7 @@ type TCPIPForward struct {
 	OriginPort uint32
 }
 
-func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
+func (srv *server) handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	defer raw.Close()
 	log.Printf("🔌 New raw connection from %s", raw.RemoteAddr())
 
@@ -360,9 +376,10 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 				serviceName: p.BindAddr,
 				userHandle:  serverConn.User(),
 			}
-			err = configureNewForward(ctx, f)
+			err = srv.configureNewForward(ctx, f)
 			if err != nil {
 				log.Printf("❌ failed to setup caddy forward for %s: %v", p.BindAddr, err)
+				listener.Close()
 				req.Reply(false, nil)
 				continue
 			}
@@ -383,7 +400,7 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 			if f, ok := forwards[p.BindAddr]; ok {
 				f.listener.Close()
 				ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-				err := unconfigureForward(ctx, f)
+				err := srv.unconfigureForward(ctx, f)
 				if err != nil {
 					log.Printf("failed to removed forward %+v: %+v", f, err)
 				}
@@ -409,7 +426,7 @@ func handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	for _, f := range forwards {
 		f.listener.Close()
 		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		err := unconfigureForward(ctx, f)
+		err := srv.unconfigureForward(ctx, f)
 		if err != nil {
 			log.Printf("failed to removed forward %+v: %+v", f, err)
 		}
@@ -470,16 +487,6 @@ func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TC
 	log.Printf("✅ closed TCP proxy for %s:%d", f.BindAddr, f.BindPort)
 }
 
-// getCaddyClient is a helper to build an HTTP client that communicates over a Unix socket
-func getCaddyClient(caddySockPath string) *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", caddySockPath)
-			},
-		},
-	}
-}
 
 // ensureSrv0Exists checks if srv0 is initialized and creates it if not.
 // When CF_API_TOKEN is set, it also installs the TLS automation policy that
@@ -833,7 +840,7 @@ func forwardFQDNs(f *forward, thisEndpoint string) []string {
 	return []string{serviceLabel(f.serviceName, f.userHandle) + "." + thisEndpoint}
 }
 
-func configureNewForward(ctx context.Context, f *forward) error {
+func (srv *server) configureNewForward(ctx context.Context, f *forward) error {
 	thisEndpoint := os.Getenv("THIS_ENDPOINT")
 	if thisEndpoint == "" {
 		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
@@ -842,12 +849,12 @@ func configureNewForward(ctx context.Context, f *forward) error {
 	if caddySockPath == "" {
 		return fmt.Errorf("CADDY_SOCK must be set")
 	}
-	client := getCaddyClient(caddySockPath)
+	client := srv.caddyClient
 
 	// Ensure srv0 + the wildcard DNS-01 policy + catch-all exist before
 	// posting routes (avoids a 404 on the routes array, and guarantees the
 	// on_demand policy the cert gate depends on is present).
-	if err := ensureSrv0Exists(ctx, client); err != nil {
+	if err := ensureSrv0Exists(ctx, srv.caddyClient); err != nil {
 		return errors.Wrap(err, "failed to ensure srv0 existence")
 	}
 
@@ -859,7 +866,7 @@ func configureNewForward(ctx context.Context, f *forward) error {
 	}
 
 	for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
-		if err := ensureForwardRoute(ctx, client, fqdn, f.localPath); err != nil {
+		if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, f.localPath); err != nil {
 			return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
 		}
 		// Normal flattened hosts ride the shared "*.<endpoint>" wildcard cert,
@@ -871,16 +878,16 @@ func configureNewForward(ctx context.Context, f *forward) error {
 	}
 
 	// Re-append catch-all AFTER the new forward route so it stays last.
-	if err := ensureCatchAllRoute(ctx, client); err != nil {
+	if err := ensureCatchAllRoute(ctx, srv.caddyClient); err != nil {
 		return errors.Wrap(err, "ensure catch-all route after forward")
 	}
 
 	// Record the forward so the reconcile loop re-pushes its routes if Caddy
 	// is restarted and loses them. Must happen AFTER all fallible operations
 	// so a partial failure does not leak a stale entry in the global map.
-	regMu.Lock()
-	reg[forwardKey(f)] = f
-	regMu.Unlock()
+	srv.regMu.Lock()
+	srv.reg[forwardKey(f)] = f
+	srv.regMu.Unlock()
 
 	return nil
 }
@@ -998,33 +1005,33 @@ func idExists(ctx context.Context, client *http.Client, id string) bool {
 // per-forward route — and the relay's live SSH sessions would never re-push
 // them on their own. Every tick it reinstalls the base config and any missing
 // forward routes. Steady-state ticks are GET-only, so this is cheap.
-func reconcileLoop(client *http.Client) {
+func (srv *server) reconcileLoop() {
 	const interval = 30 * time.Second
 	for {
 		func() {
 			ctx, cancel := context.WithTimeout(context.Background(), interval)
 			defer cancel()
 
-			if err := ensureSrv0Exists(ctx, client); err != nil {
+			if err := ensureSrv0Exists(ctx, srv.caddyClient); err != nil {
 				log.Printf("⚠️ reconcile base config: %v", err)
 				return
 			}
 
 			thisEndpoint := os.Getenv("THIS_ENDPOINT")
-			regMu.Lock()
-			fwds := make([]*forward, 0, len(reg))
-			for _, f := range reg {
+			srv.regMu.Lock()
+			fwds := make([]*forward, 0, len(srv.reg))
+			for _, f := range srv.reg {
 				fwds = append(fwds, f)
 			}
-			regMu.Unlock()
+			srv.regMu.Unlock()
 
 			appended := false
 			for _, f := range fwds {
 				for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
-					if idExists(ctx, client, "route-"+fqdn) {
+					if idExists(ctx, srv.caddyClient, "route-"+fqdn) {
 						continue
 					}
-					if err := ensureForwardRoute(ctx, client, fqdn, f.localPath); err != nil {
+					if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, f.localPath); err != nil {
 						log.Printf("⚠️ reconcile route %s: %v", fqdn, err)
 						continue
 					}
@@ -1041,8 +1048,8 @@ func reconcileLoop(client *http.Client) {
 			// ACME orders, so any HTTP-01 cert never gets a full issuance
 			// window. Skipping the write keeps steady-state ticks GET-only.
 			catchAllID := "route-wildcard-catchall-" + thisEndpoint
-			if appended || !idExists(ctx, client, catchAllID) {
-				if err := ensureCatchAllRoute(ctx, client); err != nil {
+			if appended || !idExists(ctx, srv.caddyClient, catchAllID) {
+				if err := ensureCatchAllRoute(ctx, srv.caddyClient); err != nil {
 					log.Printf("⚠️ reconcile catch-all route: %v", err)
 				}
 			}
@@ -1051,7 +1058,7 @@ func reconcileLoop(client *http.Client) {
 	}
 }
 
-func unconfigureForward(ctx context.Context, f *forward) error {
+func (srv *server) unconfigureForward(ctx context.Context, f *forward) error {
 	thisEndpoint := os.Getenv("THIS_ENDPOINT")
 	if thisEndpoint == "" {
 		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
@@ -1059,11 +1066,11 @@ func unconfigureForward(ctx context.Context, f *forward) error {
 
 	// Stop reconciling this forward before tearing its routes down, so the
 	// loop doesn't race to re-add what we're removing.
-	regMu.Lock()
-	if reg[forwardKey(f)] == f {
-		delete(reg, forwardKey(f))
+	srv.regMu.Lock()
+	if srv.reg[forwardKey(f)] == f {
+		delete(srv.reg, forwardKey(f))
 	}
-	regMu.Unlock()
+	srv.regMu.Unlock()
 
 	fqdns := forwardFQDNs(f, thisEndpoint)
 	for _, fqdn := range fqdns {
@@ -1074,7 +1081,7 @@ func unconfigureForward(ctx context.Context, f *forward) error {
 			return fmt.Errorf("CADDY_SOCK must be set")
 		}
 
-		client := getCaddyClient(caddySockPath)
+		client := srv.caddyClient
 
 		// Direct DELETE using the Caddy ID shortcut removes it instantly
 		req, err := http.NewRequestWithContext(ctx, "DELETE", fmt.Sprintf("http://127.0.0.1/id/%s", routeID), nil)
@@ -1125,17 +1132,39 @@ func (k *SSHPublicKey) ATProtoDecode(rec *agnostic.RepoListRecords_Record) error
 	return nil
 }
 
-func resolveATProtoIdentifier(ctx context.Context, inputId string) (*identity.Identity, error) {
+// pruneSSHPublicKeyCacheLoop periodically removes expired entries from the
+// SSH public key cache so cached key blobs don't accumulate forever.
+func (srv *server) pruneSSHPublicKeyCacheLoop() {
+	for {
+		time.Sleep(5 * time.Minute)
+		now := time.Now()
+		srv.sshPublicKeyCacheMu.Lock()
+		for k, v := range srv.sshPublicKeyCache {
+			if now.After(v.expiresAt) {
+				delete(srv.sshPublicKeyCache, k)
+			}
+		}
+		n := len(srv.sshPublicKeyCache)
+		srv.sshPublicKeyCacheMu.Unlock()
+		if n > 0 {
+			log.Printf("🧹 sshPublicKeyCache pruned, %d entries remaining", n)
+		}
+	}
+}
+
+func (srv *server) resolveATProtoIdentifier(ctx context.Context, inputId string) (*identity.Identity, error) {
 	id, err := syntax.ParseAtIdentifier(inputId)
 	if err != nil {
 		return nil, err
 	}
 	slog.Info("valid syntax", "at-identifier", id)
 
-	// https://github.com/bluesky-social/indigo/blob/ce62b8fce9e01434213a69cb251852b2c9436cb9/atproto/identity/directory.go#L65
-	// DefaultDirectory is https://plc.directory
-	dir := identity.DefaultDirectory()
-	ident, err := dir.Lookup(ctx, id)
+	// DefaultDirectory returns a CacheDirectory wrapping BaseDirectory.
+	// Each CacheDirectory creates two expirable LRU caches backed by a
+	// background goroutine. Call once and reuse — creating one per auth
+	// attempt leaks goroutines unboundedly.
+	// srv.directory was initialized once in main()
+	ident, err := srv.directory.Lookup(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1148,28 +1177,28 @@ func resolveATProtoIdentifier(ctx context.Context, inputId string) (*identity.Id
 // caching avoids paginating the user's entire SSH key collection from the PDS
 // on every single attempt. Errors are also cached (negative caching) with a
 // shorter TTL so a failing PDS doesn't get hammered on every reconnect.
-func cachedGetSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
-	sshPublicKeyCacheMu.RLock()
-	if entry, ok := sshPublicKeyCache[did]; ok && time.Now().Before(entry.expiresAt) {
+func (srv *server) cachedGetSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey, error) {
+	srv.sshPublicKeyCacheMu.RLock()
+	if entry, ok := srv.sshPublicKeyCache[did]; ok && time.Now().Before(entry.expiresAt) {
 		keys, err := entry.keys, entry.err
-		sshPublicKeyCacheMu.RUnlock()
+		srv.sshPublicKeyCacheMu.RUnlock()
 		return keys, err
 	}
-	sshPublicKeyCacheMu.RUnlock()
+	srv.sshPublicKeyCacheMu.RUnlock()
 
 	keys, err := getSSHPublicKeys(ctx, pdsUrl, did)
 
-	sshPublicKeyCacheMu.Lock()
+	srv.sshPublicKeyCacheMu.Lock()
 	ttl := sshPublicKeyCacheTTL
 	if err != nil {
 		ttl = sshPublicKeyNegCacheTTL
 	}
-	sshPublicKeyCache[did] = &sshPublicKeyCacheEntry{
+	srv.sshPublicKeyCache[did] = &sshPublicKeyCacheEntry{
 		keys:      keys,
 		err:       err,
 		expiresAt: time.Now().Add(ttl),
 	}
-	sshPublicKeyCacheMu.Unlock()
+	srv.sshPublicKeyCacheMu.Unlock()
 
 	return keys, err
 }
