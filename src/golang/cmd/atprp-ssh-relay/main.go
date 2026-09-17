@@ -619,40 +619,45 @@ func ensureWildcardTLSPolicy(ctx context.Context, client *http.Client) error {
 	policyID := "tls-policy-wildcard-" + thisEndpoint
 	wildcard := "*." + thisEndpoint
 
-	// Fast path: policy already present, nothing to write.
-	if idExists(ctx, client, policyID) {
-		return nil
-	}
-
-	// One DNS-01 (Cloudflare) automation policy, subject-less so it's Caddy's
-	// default issuer. on_demand stays enabled as a FALLBACK — gated by
-	// on_demand_tls.ask — for names not covered by the shared wildcard, e.g. an
-	// explicit "*.service" child wildcard. Normal flattened hosts never reach
-	// on_demand: the shared "*.<endpoint>" wildcard cert (automated just below)
-	// is already loaded and served for them, so no per-name ACME happens.
-	policy := map[string]any{
-		"@id":       policyID,
-		"on_demand": true,
-		"issuers": []map[string]any{
-			{
-				"module": "acme",
-				"challenges": map[string]any{
-					"dns": map[string]any{
-						"provider": map[string]any{
-							"name":      "cloudflare",
-							"api_token": cfToken,
+	// Guard the policy WRITE only, not this whole function. Rewriting the policy
+	// every reconcile tick reloads Caddy's config every 30s, and each reload
+	// cancels in-flight ACME orders. The cert registration below must still run
+	// on every pass: gating it behind this same early return is exactly how the
+	// wildcard was left unmanaged, unrenewed, and eventually deleted.
+	if !idExists(ctx, client, policyID) {
+		// One DNS-01 (Cloudflare) automation policy, subject-less so it's Caddy's
+		// default issuer. on_demand stays enabled as a FALLBACK — gated by
+		// on_demand_tls.ask — for names not covered by the shared wildcard, e.g. an
+		// explicit "*.service" child wildcard. Normal flattened hosts never reach
+		// on_demand: the shared "*.<endpoint>" wildcard cert (automated below)
+		// is already loaded and served for them, so no per-name ACME happens.
+		policy := map[string]any{
+			"@id":       policyID,
+			"on_demand": true,
+			"issuers": []map[string]any{
+				{
+					"module": "acme",
+					"challenges": map[string]any{
+						"dns": map[string]any{
+							"provider": map[string]any{
+								"name":      "cloudflare",
+								"api_token": cfToken,
+							},
 						},
 					},
 				},
 			},
-		},
-	}
-	if err := upsertAutomationPolicy(ctx, client, policyID, policy); err != nil {
-		return errors.Wrap(err, "ensure tls automation policy")
+		}
+		if err := upsertAutomationPolicy(ctx, client, policyID, policy); err != nil {
+			return errors.Wrap(err, "ensure tls automation policy")
+		}
 	}
 
-	// Proactively manage the ONE shared wildcard cert so every flattened
-	// svc--handle host is served from it (no per-name ACME).
+	// Register the shared wildcard with Caddy's cert automator so every
+	// flattened svc--handle host is served from it (no per-name ACME). This is
+	// what puts the cert under Caddy's maintenance, and a cert Caddy does not
+	// manage is a cert Caddy will not renew: the wildcard has no site block, so
+	// nothing else ever asks Caddy for it. Cheap once registered (one GET).
 	triggerCertIssuance(ctx, client, wildcard)
 	return nil
 }
@@ -962,26 +967,68 @@ func ensureForwardRoute(ctx context.Context, client *http.Client, fqdn, localPat
 	return nil
 }
 
-// triggerCertIssuance best-effort adds the name to the managed-cert list so
-// DNS-01 issuance starts immediately rather than on the first handshake. Used
-// for the shared "*.<endpoint>" wildcard and for explicit "*.service" child
-// wildcards (which on_demand cannot mint). Best-effort: errors non-fatal.
+// triggerCertIssuance best-effort adds the name to Caddy's automated-cert list
+// so DNS-01 issuance starts immediately rather than on the first handshake, and
+// so Caddy keeps renewing it afterwards. Used for the shared "*.<endpoint>"
+// wildcard and for explicit "*.service" child wildcards (which on_demand cannot
+// mint). Best-effort: errors non-fatal.
+//
+// The list is a single JSON array at apps/tls/certificates/automate, so a blind
+// write would drop names registered by earlier calls (the wildcard plus every
+// child wildcard). Read it first and write the union: PUT creates the entry,
+// PATCH replaces it. POST is not a config-write verb here and Caddy rejects it
+// with "invalid traversal path", which is why the wildcard was never obtained.
 func triggerCertIssuance(ctx context.Context, client *http.Client, fqdn string) {
-	body, err := json.Marshal([]string{fqdn})
+	const url = "http://127.0.0.1/config/apps/tls/certificates/automate"
+
+	var subjects []string
+	pathExists := false
+	getReq, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST",
-		"http://127.0.0.1/config/apps/tls/certificates/automate", bytes.NewReader(body))
+	if resp, err := client.Do(getReq); err == nil {
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		trimmed := strings.TrimSpace(string(data))
+		if resp.StatusCode == http.StatusOK && trimmed != "" && trimmed != "null" {
+			pathExists = true
+			if err := json.Unmarshal(data, &subjects); err != nil {
+				log.Printf("⚠️ cert automation: decoding existing list: %v", err)
+				return
+			}
+		}
+	}
+	for _, s := range subjects {
+		if s == fqdn {
+			return
+		}
+	}
+
+	body, err := json.Marshal(append(subjects, fqdn))
+	if err != nil {
+		return
+	}
+	method := "PUT"
+	if pathExists {
+		method = "PATCH"
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
 	if err != nil {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if r, err := client.Do(req); err == nil {
-		io.Copy(io.Discard, r.Body)
-		r.Body.Close()
-		log.Printf("🔐 triggered background cert issuance for %s", fqdn)
+	resp, err := client.Do(req)
+	if err != nil {
+		return
 	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode >= 300 {
+		log.Printf("⚠️ cert automation for %s returned %d", fqdn, resp.StatusCode)
+		return
+	}
+	log.Printf("🔐 enabled Caddy cert automation for %s", fqdn)
 }
 
 // idExists reports whether Caddy has a config object with the given @id.
