@@ -77,17 +77,52 @@ type server struct {
 
 	// Forward registry for the reconcile loop.
 	regMu sync.Mutex
-	reg   map[string]*forward
+	reg   map[string][]*forward
 
 	activeConns   int64
 	maxConnsLimit int64
+
+	keepaliveInterval time.Duration
+	keepaliveTimeout  time.Duration
 }
 
 const (
-	sshPublicKeyCacheTTL       = 5 * time.Minute
-	sshPublicKeyNegCacheTTL    = 30 * time.Second
-	maxConcurrentHandshakes    = 50
+	sshPublicKeyCacheTTL     = 5 * time.Minute
+	sshPublicKeyNegCacheTTL  = 30 * time.Second
+	maxConcurrentHandshakes  = 50
+	defaultKeepaliveInterval = 10 * time.Second
+	defaultKeepaliveTimeout  = 60 * time.Second
 )
+
+func durationFromEnv(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Printf("⚠️ invalid %s=%q, using %s", name, v, def)
+		return def
+	}
+	return d
+}
+
+func activeForward(stack []*forward) *forward {
+	if len(stack) == 0 {
+		return nil
+	}
+	return stack[len(stack)-1]
+}
+
+func withoutForward(stack []*forward, f *forward) []*forward {
+	out := make([]*forward, 0, len(stack))
+	for _, g := range stack {
+		if g != f {
+			out = append(out, g)
+		}
+	}
+	return out
+}
 
 func forwardKey(f *forward) string { return f.serviceName + "\x00" + f.userHandle }
 
@@ -99,11 +134,14 @@ func main() {
 	}
 
 	srv := &server{
-		directory:        identity.DefaultDirectory(),
+		directory:         identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string]*forward),
-		maxConnsLimit:    200,
+		reg:               make(map[string][]*forward),
+		maxConnsLimit:     200,
+		keepaliveInterval: durationFromEnv("SSH_KEEPALIVE_INTERVAL", defaultKeepaliveInterval),
+		keepaliveTimeout:  durationFromEnv("SSH_KEEPALIVE_TIMEOUT", defaultKeepaliveTimeout),
 	}
+	log.Printf("💓 SSH keepalive interval=%s timeout=%s", srv.keepaliveInterval, srv.keepaliveTimeout)
 	if s := os.Getenv("CADDY_SOCK"); s != "" {
 		srv.caddyClient = &http.Client{
 			Transport: &http.Transport{
@@ -285,35 +323,30 @@ func (srv *server) handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	defer raw.Close()
 	log.Printf("🔌 New raw connection from %s", raw.RemoteAddr())
 
-	ctx, cancel := context.WithCancel(context.Background())
 	serverConn, chans, reqs, err := ssh.NewServerConn(raw, cfg)
 	if err != nil {
 		log.Printf("❌ SSH handshake failed: %v", err)
-		cancel()
 		return
 	}
-	log.Printf("✅ SSH handshake OK — user=%s", serverConn.User())
-	go func() { serverConn.Wait(); cancel() }()
+	log.Printf("✅ SSH handshake OK — user=%s remote=%s", serverConn.User(), raw.RemoteAddr())
 
-	// Send SSH-level keepalives so the underlying TCP connection never goes
-	// silent long enough to be idle-closed by network intermediaries (~18s).
+	ctx, cancel := context.WithCancel(context.Background())
+	var teardownOnce sync.Once
+	teardown := func(reason string) {
+		teardownOnce.Do(func() {
+			log.Printf("🔌 closing SSH connection user=%s remote=%s: %s", serverConn.User(), raw.RemoteAddr(), reason)
+			cancel()
+			serverConn.Close()
+			raw.Close()
+		})
+	}
+	defer teardown("session handler returned")
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				_, _, err := serverConn.SendRequest("keepalive@openssh.com", true, nil)
-				if err != nil {
-					log.Printf("⚠️ keepalive failed for user=%s: %v", serverConn.User(), err)
-					cancel()
-					return
-				}
-			}
-		}
+		err := serverConn.Wait()
+		teardown(fmt.Sprintf("connection ended: %v", err))
 	}()
+
+	go keepaliveLoop(ctx, serverConn, srv.keepaliveInterval, srv.keepaliveTimeout, teardown)
 
 	// ignore channels
 	go func() {
@@ -398,14 +431,8 @@ func (srv *server) handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 
 			mu.Lock()
 			if f, ok := forwards[p.BindAddr]; ok {
-				f.listener.Close()
-				ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-				err := srv.unconfigureForward(ctx, f)
-				if err != nil {
-					log.Printf("failed to removed forward %+v: %+v", f, err)
-				}
+				srv.removeForward(f)
 				delete(forwards, f.serviceName)
-				log.Printf("🗑 removed forward %+v", f)
 			}
 			mu.Unlock()
 			req.Reply(true, nil)
@@ -418,24 +445,61 @@ func (srv *server) handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 		}
 	}
 
-	<-ctx.Done()
-	log.Println("🔒 SSH session closed, cleaning up...")
+	teardown("global request channel closed")
+	log.Printf("🔒 SSH session closed, cleaning up... user=%s remote=%s", serverConn.User(), raw.RemoteAddr())
 
-	// Remove from Caddy
 	mu.Lock()
 	for _, f := range forwards {
-		f.listener.Close()
-		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		err := srv.unconfigureForward(ctx, f)
-		if err != nil {
-			log.Printf("failed to removed forward %+v: %+v", f, err)
-		}
+		srv.removeForward(f)
 		delete(forwards, f.serviceName)
-		log.Printf("🗑 removed forward %+v", f)
 	}
 	mu.Unlock()
 
-	log.Println("🔒 SSH session closed, cleaned up")
+	log.Printf("🔒 SSH session closed, cleaned up user=%s remote=%s", serverConn.User(), raw.RemoteAddr())
+}
+
+func (srv *server) removeForward(f *forward) {
+	f.listener.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.unconfigureForward(ctx, f); err != nil {
+		log.Printf("failed to removed forward %+v: %+v", f, err)
+	}
+	log.Printf("🗑 removed forward %+v", f)
+}
+
+func keepaliveLoop(ctx context.Context, sc *ssh.ServerConn, interval, timeout time.Duration, teardown func(string)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		res := make(chan error, 1)
+		go func() {
+			_, _, err := sc.SendRequest("keepalive@openssh.com", true, nil)
+			res <- err
+		}()
+		timer := time.NewTimer(timeout)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case err := <-res:
+			timer.Stop()
+			if err != nil {
+				log.Printf("⚠️ keepalive failed for user=%s: %v", sc.User(), err)
+				teardown(fmt.Sprintf("keepalive failed: %v", err))
+				return
+			}
+		case <-timer.C:
+			log.Printf("⚠️ keepalive unanswered for %s user=%s remote=%s", timeout, sc.User(), sc.RemoteAddr())
+			teardown(fmt.Sprintf("keepalive unanswered for %s", timeout))
+			return
+		}
+	}
 }
 
 func acceptTCPLoop(ctx context.Context, listener net.Listener, sc *ssh.ServerConn, f *TCPIPForward) {
@@ -486,7 +550,6 @@ func handleTCPConn(ctx context.Context, conn net.Conn, sc *ssh.ServerConn, f *TC
 	channel.Close()
 	log.Printf("✅ closed TCP proxy for %s:%d", f.BindAddr, f.BindPort)
 }
-
 
 // ensureSrv0Exists checks if srv0 is initialized and creates it if not.
 // When CF_API_TOKEN is set, it also installs the TLS automation policy that
@@ -870,6 +933,9 @@ func (srv *server) configureNewForward(ctx context.Context, f *forward) error {
 		return fmt.Errorf("flattened service label %q is %d chars, over the 63-char DNS label limit (service=%q handle=%q)", label, len(label), f.serviceName, f.userHandle)
 	}
 
+	srv.regMu.Lock()
+	defer srv.regMu.Unlock()
+
 	for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
 		if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, f.localPath); err != nil {
 			return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
@@ -890,9 +956,11 @@ func (srv *server) configureNewForward(ctx context.Context, f *forward) error {
 	// Record the forward so the reconcile loop re-pushes its routes if Caddy
 	// is restarted and loses them. Must happen AFTER all fallible operations
 	// so a partial failure does not leak a stale entry in the global map.
-	srv.regMu.Lock()
-	srv.reg[forwardKey(f)] = f
-	srv.regMu.Unlock()
+	key := forwardKey(f)
+	srv.reg[key] = append(withoutForward(srv.reg[key], f), f)
+	if n := len(srv.reg[key]); n > 1 {
+		log.Printf("🔀 route for %s taken over by %s (%d live sessions)", f.serviceName, f.localPath, n)
+	}
 
 	return nil
 }
@@ -1066,11 +1134,13 @@ func (srv *server) reconcileLoop() {
 
 			thisEndpoint := os.Getenv("THIS_ENDPOINT")
 			srv.regMu.Lock()
+			defer srv.regMu.Unlock()
 			fwds := make([]*forward, 0, len(srv.reg))
-			for _, f := range srv.reg {
-				fwds = append(fwds, f)
+			for _, stack := range srv.reg {
+				if f := activeForward(stack); f != nil {
+					fwds = append(fwds, f)
+				}
 			}
-			srv.regMu.Unlock()
 
 			appended := false
 			for _, f := range fwds {
@@ -1111,15 +1181,36 @@ func (srv *server) unconfigureForward(ctx context.Context, f *forward) error {
 		return fmt.Errorf("THIS_ENDPOINT must be set to root FQDN")
 	}
 
-	// Stop reconciling this forward before tearing its routes down, so the
-	// loop doesn't race to re-add what we're removing.
 	srv.regMu.Lock()
-	if srv.reg[forwardKey(f)] == f {
-		delete(srv.reg, forwardKey(f))
+	defer srv.regMu.Unlock()
+	key := forwardKey(f)
+	stack := srv.reg[key]
+	wasOwner := activeForward(stack) == f
+	stack = withoutForward(stack, f)
+	if len(stack) == 0 {
+		delete(srv.reg, key)
+	} else {
+		srv.reg[key] = stack
 	}
-	srv.regMu.Unlock()
+	if !wasOwner {
+		log.Printf("ℹ️ %s did not own the route for %s; route left in place", f.localPath, f.serviceName)
+		return nil
+	}
 
 	fqdns := forwardFQDNs(f, thisEndpoint)
+	if next := activeForward(stack); next != nil {
+		for _, fqdn := range fqdns {
+			if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, next.localPath); err != nil {
+				return errors.Wrap(err, fmt.Sprintf("error handing route for fqdn=%s to %s", fqdn, next.localPath))
+			}
+		}
+		if err := ensureCatchAllRoute(ctx, srv.caddyClient); err != nil {
+			return errors.Wrap(err, "ensure catch-all route after route handoff")
+		}
+		log.Printf("🔀 route for %s handed back to %s", f.serviceName, next.localPath)
+		return nil
+	}
+
 	for _, fqdn := range fqdns {
 		routeID := "route-" + fqdn
 

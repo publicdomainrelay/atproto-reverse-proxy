@@ -108,7 +108,7 @@ func TestResolveATProtoIdentifierReusesCachedDirectory(t *testing.T) {
 	srv := &server{
 		directory:        fake,
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string]*forward),
+		reg:              make(map[string][]*forward),
 	}
 
 	ctx := context.Background()
@@ -139,7 +139,7 @@ func TestResolveATProtoIdentifierDoesNotCreateNewDirectories(t *testing.T) {
 	srv := &server{
 		directory:        identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string]*forward),
+		reg:              make(map[string][]*forward),
 	}
 
 	// Warm up: let the 2 LRU goroutines settle.
@@ -184,7 +184,7 @@ func TestServerInit(t *testing.T) {
 	srv := &server{
 		directory:        identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string]*forward),
+		reg:              make(map[string][]*forward),
 		maxConnsLimit:    200,
 	}
 	if srv.directory == nil {
@@ -202,7 +202,7 @@ func TestServerCaddyClient(t *testing.T) {
 	srv := &server{
 		directory:        identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string]*forward),
+		reg:              make(map[string][]*forward),
 		caddyClient:       &http.Client{Transport: &http.Transport{}},
 	}
 	if srv.caddyClient == nil {
@@ -223,7 +223,7 @@ func TestPruneSSHPublicKeyCacheLoop(t *testing.T) {
 	srv := &server{
 		directory:        identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string]*forward),
+		reg:              make(map[string][]*forward),
 	}
 
 	srv.sshPublicKeyCacheMu.Lock()
