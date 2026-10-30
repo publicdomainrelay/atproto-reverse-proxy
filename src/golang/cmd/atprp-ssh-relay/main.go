@@ -76,8 +76,9 @@ type server struct {
 	sshPublicKeyCache   map[string]*sshPublicKeyCacheEntry
 
 	// Forward registry for the reconcile loop.
-	regMu sync.Mutex
-	reg   map[string][]*forward
+	regMu  sync.Mutex
+	reg    map[string][]*forward
+	routed map[string]string
 
 	activeConns   int64
 	maxConnsLimit int64
@@ -101,7 +102,7 @@ func durationFromEnv(name string, def time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
-		log.Printf("⚠️ invalid %s=%q, using %s", name, v, def)
+		log.Printf("invalid %s=%q, using %s", name, v, def)
 		return def
 	}
 	return d
@@ -126,6 +127,17 @@ func withoutForward(stack []*forward, f *forward) []*forward {
 
 func forwardKey(f *forward) string { return f.serviceName + "\x00" + f.userHandle }
 
+func (srv *server) setRouted(key, localPath string) {
+	if srv.routed == nil {
+		srv.routed = make(map[string]string)
+	}
+	if localPath == "" {
+		delete(srv.routed, key)
+		return
+	}
+	srv.routed[key] = localPath
+}
+
 func main() {
 	log.Println("▶️ Starting SSH-forward server")
 
@@ -141,9 +153,10 @@ func main() {
 		keepaliveInterval: durationFromEnv("SSH_KEEPALIVE_INTERVAL", defaultKeepaliveInterval),
 		keepaliveTimeout:  durationFromEnv("SSH_KEEPALIVE_TIMEOUT", defaultKeepaliveTimeout),
 	}
-	log.Printf("💓 SSH keepalive interval=%s timeout=%s", srv.keepaliveInterval, srv.keepaliveTimeout)
+	log.Printf("SSH keepalive interval=%s timeout=%s", srv.keepaliveInterval, srv.keepaliveTimeout)
 	if s := os.Getenv("CADDY_SOCK"); s != "" {
 		srv.caddyClient = &http.Client{
+			Timeout: 15 * time.Second,
 			Transport: &http.Transport{
 				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 					return net.Dial("unix", s)
@@ -179,7 +192,7 @@ func main() {
 			log.Printf("Resolving DID PLC and PDS for user=%s", c.User())
 			ident, err := srv.resolveATProtoIdentifier(ctx, c.User())
 			if err != nil {
-				return nil, errors.Wrap(err, fmt.Sprintf("Failed to resolve DID PLC and PDS for user=%s: %v", c.User()))
+				return nil, errors.Wrap(err, fmt.Sprintf("Failed to resolve DID PLC and PDS for user=%s", c.User()))
 			}
 			pds := ident.PDSEndpoint()
 			if pds == "" {
@@ -334,7 +347,7 @@ func (srv *server) handleSSH(raw net.Conn, cfg *ssh.ServerConfig) {
 	var teardownOnce sync.Once
 	teardown := func(reason string) {
 		teardownOnce.Do(func() {
-			log.Printf("🔌 closing SSH connection user=%s remote=%s: %s", serverConn.User(), raw.RemoteAddr(), reason)
+			log.Printf("closing SSH connection user=%s remote=%s: %s", serverConn.User(), raw.RemoteAddr(), reason)
 			cancel()
 			serverConn.Close()
 			raw.Close()
@@ -495,7 +508,7 @@ func keepaliveLoop(ctx context.Context, sc *ssh.ServerConn, interval, timeout ti
 				return
 			}
 		case <-timer.C:
-			log.Printf("⚠️ keepalive unanswered for %s user=%s remote=%s", timeout, sc.User(), sc.RemoteAddr())
+			log.Printf("keepalive unanswered for %s user=%s remote=%s", timeout, sc.User(), sc.RemoteAddr())
 			teardown(fmt.Sprintf("keepalive unanswered for %s", timeout))
 			return
 		}
@@ -935,9 +948,11 @@ func (srv *server) configureNewForward(ctx context.Context, f *forward) error {
 
 	srv.regMu.Lock()
 	defer srv.regMu.Unlock()
+	key := forwardKey(f)
 
 	for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
 		if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, f.localPath); err != nil {
+			srv.setRouted(key, "")
 			return errors.Wrap(err, fmt.Sprintf("error configuring caddy for fqdn=%s", fqdn))
 		}
 		// Normal flattened hosts ride the shared "*.<endpoint>" wildcard cert,
@@ -956,10 +971,10 @@ func (srv *server) configureNewForward(ctx context.Context, f *forward) error {
 	// Record the forward so the reconcile loop re-pushes its routes if Caddy
 	// is restarted and loses them. Must happen AFTER all fallible operations
 	// so a partial failure does not leak a stale entry in the global map.
-	key := forwardKey(f)
+	srv.setRouted(key, f.localPath)
 	srv.reg[key] = append(withoutForward(srv.reg[key], f), f)
 	if n := len(srv.reg[key]); n > 1 {
-		log.Printf("🔀 route for %s taken over by %s (%d live sessions)", f.serviceName, f.localPath, n)
+		log.Printf("route for %s taken over by %s (%d live sessions)", f.serviceName, f.localPath, n)
 	}
 
 	return nil
@@ -1135,25 +1150,36 @@ func (srv *server) reconcileLoop() {
 			thisEndpoint := os.Getenv("THIS_ENDPOINT")
 			srv.regMu.Lock()
 			defer srv.regMu.Unlock()
-			fwds := make([]*forward, 0, len(srv.reg))
-			for _, stack := range srv.reg {
-				if f := activeForward(stack); f != nil {
-					fwds = append(fwds, f)
-				}
-			}
 
 			appended := false
-			for _, f := range fwds {
+			for key, stack := range srv.reg {
+				f := activeForward(stack)
+				if f == nil {
+					continue
+				}
+				stale := srv.routed[key] != f.localPath
+				ok := true
 				for _, fqdn := range forwardFQDNs(f, thisEndpoint) {
-					if idExists(ctx, srv.caddyClient, "route-"+fqdn) {
+					missing := !idExists(ctx, srv.caddyClient, "route-"+fqdn)
+					if !stale && !missing {
 						continue
 					}
 					if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, f.localPath); err != nil {
 						log.Printf("⚠️ reconcile route %s: %v", fqdn, err)
+						ok = false
 						continue
 					}
 					appended = true
-					log.Printf("♻️ reconciled missing route %s", fqdn)
+					if missing {
+						log.Printf("♻️ reconciled missing route %s", fqdn)
+					} else {
+						log.Printf("reconciled route %s to owner %s", fqdn, f.localPath)
+					}
+				}
+				if ok {
+					srv.setRouted(key, f.localPath)
+				} else {
+					srv.setRouted(key, "")
 				}
 			}
 
@@ -1193,23 +1219,26 @@ func (srv *server) unconfigureForward(ctx context.Context, f *forward) error {
 		srv.reg[key] = stack
 	}
 	if !wasOwner {
-		log.Printf("ℹ️ %s did not own the route for %s; route left in place", f.localPath, f.serviceName)
+		log.Printf("%s did not own the route for %s; route left in place", f.localPath, f.serviceName)
 		return nil
 	}
 
 	fqdns := forwardFQDNs(f, thisEndpoint)
 	if next := activeForward(stack); next != nil {
+		srv.setRouted(key, "")
 		for _, fqdn := range fqdns {
 			if err := ensureForwardRoute(ctx, srv.caddyClient, fqdn, next.localPath); err != nil {
 				return errors.Wrap(err, fmt.Sprintf("error handing route for fqdn=%s to %s", fqdn, next.localPath))
 			}
 		}
+		srv.setRouted(key, next.localPath)
 		if err := ensureCatchAllRoute(ctx, srv.caddyClient); err != nil {
 			return errors.Wrap(err, "ensure catch-all route after route handoff")
 		}
-		log.Printf("🔀 route for %s handed back to %s", f.serviceName, next.localPath)
+		log.Printf("route for %s handed back to %s", f.serviceName, next.localPath)
 		return nil
 	}
+	srv.setRouted(key, "")
 
 	for _, fqdn := range fqdns {
 		routeID := "route-" + fqdn
@@ -1354,7 +1383,7 @@ func getSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey,
 		// last arg is reverse (oldest first)
 		out, err := agnostic.RepoListRecords(ctx, pds, collection, cursor, limit, did, false)
 		if err != nil {
-			return nil, errors.Wrap(err, fmt.Sprintf("error calling RepoListRecords(pds=%s, did=%s)", pds, did))
+			return nil, errors.Wrap(err, fmt.Sprintf("error calling RepoListRecords(pds=%s, did=%s)", pds.Host, did))
 		}
 
 		for _, rec := range out.Records {
@@ -1366,7 +1395,7 @@ func getSSHPublicKeys(ctx context.Context, pdsUrl, did string) ([]*SSHPublicKey,
 
 			err := sshPublicKey.ATProtoDecode(rec)
 			if err != nil {
-				return nil, errors.Wrap(err, fmt.Sprintf("error unmarshaling json value of type sshPublicKey(pds=%s, did=%s, uri=%s)", pds, did, rec.Uri))
+				return nil, errors.Wrap(err, fmt.Sprintf("error unmarshaling json value of type sshPublicKey(pds=%s, did=%s, uri=%s)", pds.Host, did, rec.Uri))
 			}
 
 			sshPublicKeys = append(sshPublicKeys, &sshPublicKey)

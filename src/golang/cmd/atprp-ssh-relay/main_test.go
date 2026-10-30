@@ -106,9 +106,9 @@ func TestDefaultDirectoryGoroutineLeak(t *testing.T) {
 func TestResolveATProtoIdentifierReusesCachedDirectory(t *testing.T) {
 	fake := &countingDirectory{}
 	srv := &server{
-		directory:        fake,
+		directory:         fake,
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string][]*forward),
+		reg:               make(map[string][]*forward),
 	}
 
 	ctx := context.Background()
@@ -137,9 +137,9 @@ func TestResolveATProtoIdentifierReusesCachedDirectory(t *testing.T) {
 // test completes in milliseconds regardless of iteration count.
 func TestResolveATProtoIdentifierDoesNotCreateNewDirectories(t *testing.T) {
 	srv := &server{
-		directory:        identity.DefaultDirectory(),
+		directory:         identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string][]*forward),
+		reg:               make(map[string][]*forward),
 	}
 
 	// Warm up: let the 2 LRU goroutines settle.
@@ -182,10 +182,10 @@ func TestResolveATProtoIdentifierDoesNotCreateNewDirectories(t *testing.T) {
 
 func TestServerInit(t *testing.T) {
 	srv := &server{
-		directory:        identity.DefaultDirectory(),
+		directory:         identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string][]*forward),
-		maxConnsLimit:    200,
+		reg:               make(map[string][]*forward),
+		maxConnsLimit:     200,
 	}
 	if srv.directory == nil {
 		t.Fatal("directory not initialized")
@@ -200,9 +200,9 @@ func TestServerInit(t *testing.T) {
 
 func TestServerCaddyClient(t *testing.T) {
 	srv := &server{
-		directory:        identity.DefaultDirectory(),
+		directory:         identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string][]*forward),
+		reg:               make(map[string][]*forward),
 		caddyClient:       &http.Client{Transport: &http.Transport{}},
 	}
 	if srv.caddyClient == nil {
@@ -221,9 +221,9 @@ func TestServerCaddyClient(t *testing.T) {
 
 func TestPruneSSHPublicKeyCacheLoop(t *testing.T) {
 	srv := &server{
-		directory:        identity.DefaultDirectory(),
+		directory:         identity.DefaultDirectory(),
 		sshPublicKeyCache: make(map[string]*sshPublicKeyCacheEntry),
-		reg:              make(map[string][]*forward),
+		reg:               make(map[string][]*forward),
 	}
 
 	srv.sshPublicKeyCacheMu.Lock()
